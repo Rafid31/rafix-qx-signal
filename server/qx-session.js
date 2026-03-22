@@ -126,7 +126,7 @@ class QXSession {
 
   async _login() {
     console.log('[QX] Navigating to sign-in...');
-    await this.page.goto('https://qxbroker.com/en/sign-in', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await this.page.goto('https://market-qx.trade/en/sign-in', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await new Promise(r => setTimeout(r, 5000));
 
     const emailSels = ['input[type="email"]','input[name="email"]','input[placeholder*="mail" i]','form input:first-of-type'];
@@ -180,7 +180,7 @@ class QXSession {
       }
     }
 
-    await this.page.goto('https://qxbroker.com/en/demo-trade', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await this.page.goto('https://market-qx.trade/en/demo-trade', { waitUntil: 'domcontentloaded', timeout: 60000 });
     await new Promise(r => setTimeout(r, 8000)); // Wait for React store to load
     console.log('[QX] Logged in. URL:', this.page.url());
   }
