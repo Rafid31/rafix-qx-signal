@@ -3,12 +3,12 @@ class PairScorer {
   score(candles) {
     if (candles.length < 30) return 0;
     let score = 0;
-    // 1. Session (Dubai UTC+4)
+    // 1. Session (Dubai UTC+4) — all sessions shown, just quality scored
     const h = new Date(Date.now() + 4*3600000).getUTCHours();
-    if (h>=17&&h<20) score+=25;
-    else if (h>=12&&h<22) score+=15;
-    else if (h>=4&&h<12) score+=0;
-    else score+=5;
+    if (h>=17&&h<20) score+=25;       // London+NY overlap — best
+    else if (h>=12&&h<22) score+=20;  // London or NY — good
+    else if (h>=4&&h<12) score+=12;   // Asian — lower but still shown
+    else score+=10;                    // Late NY / early morning
     // 2. Trend bias (last 10 candles)
     const l10=candles.slice(-10);
     const bias=Math.abs(l10.filter(c=>c.c>c.o).length-5);

@@ -145,9 +145,9 @@ function runLoop() {
     };
   });
 
-  // Top 4 quality pairs only (score >= 40)
+  // Show pairs scoring 20+ (was 40 — lowered so Asian session pairs show)
   const active = Object.values(updates)
-    .filter(p => p.quality >= 40)
+    .filter(p => p.quality >= 20)
     .sort((a, b) => b.quality - a.quality)
     .slice(0, 4);
 
