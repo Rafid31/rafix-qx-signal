@@ -11,9 +11,8 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// QX demo account — set via Railway env vars
-const QX_EMAIL = process.env.QX_EMAIL || '';
-const QX_PASS  = process.env.QX_PASS  || '';
+// QX session token — set via Railway env var QX_TOKEN
+const QX_TOKEN = process.env.QX_TOKEN || '';
 
 // Telegram bot for verification code alerts
 const TG_TOKEN  = process.env.TG_TOKEN  || '8701910654:AAE5Xcl3tFRGhtArlOXjFQ9EFlnL3IOBl1U';
@@ -230,36 +229,29 @@ async function pollTelegram() {
   }
 }
 
-// Start session
+// Start session — pure WebSocket with token, no Puppeteer
 async function startSession() {
-  if (!QX_EMAIL || !QX_PASS) {
-    console.log('[Server] No QX credentials — set QX_EMAIL and QX_PASS in Railway env vars');
-    await tgSend('⚠️ RafiX Server started but NO QX credentials set.\nAdd QX_EMAIL and QX_PASS in Railway environment variables.');
+  if (!QX_TOKEN) {
+    console.log('[Server] No QX_TOKEN set — add it in Railway env vars');
+    await tgSend('⚠️ RafiX Server: QX_TOKEN not set. Add it in Railway → Variables → QX_TOKEN');
     return;
   }
   try {
     session = new QXSession({
-      email: QX_EMAIL, pass: QX_PASS,
+      token: QX_TOKEN,
       onTick: processTick,
-      onVerifyNeeded: async (emailHint) => {
-        const msg = `🔐 QX needs verification code!\n\nCheck email: ${emailHint}\n\nReply with:\n/code 123456\n\nOr go to: ${process.env.RAILWAY_PUBLIC_DOMAIN ? 'https://'+process.env.RAILWAY_PUBLIC_DOMAIN+'/admin' : 'Railway URL/admin'}`;
-        await tgSend(msg);
-        console.log('[Session] Waiting for verification code via Telegram or /admin page...');
-        const code = await waitForTelegramCode(300000); // 5 min timeout
-        return code;
-      },
       onDisconnect: async () => {
-        console.log('[Session] Disconnected — restarting in 30s');
+        console.log('[Session] Disconnected — restarting in 15s');
         session = null;
-        setTimeout(startSession, 30000);
+        setTimeout(startSession, 15000);
       }
     });
     await session.start();
-    await tgSend('✅ RafiX Signal Server is LIVE!\nMonitoring ' + ALL_PAIRS.length + ' OTC pairs 24/7');
+    await tgSend('✅ RafiX Signal Server is LIVE!\nMonitoring ' + ALL_PAIRS.length + ' OTC pairs 24/7\nNo login required — direct WebSocket connection');
   } catch(e) {
     console.error('[Session] Error:', e.message);
     session = null;
-    setTimeout(startSession, 120000); // wait 2 min before retry
+    setTimeout(startSession, 30000);
   }
 }
 
