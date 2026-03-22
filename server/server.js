@@ -1,4 +1,4 @@
-// RafiX QX Signal Server v5 — Twelve Data API (24/7, no PC needed)
+// RafiX Signal Server v6 — Pocket Option WebSocket (24/7, no PC, no IP blocks)
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
@@ -249,16 +249,16 @@ async function pollTelegram() {
   }
 }
 
-// Start session — Twelve Data API, no login, 24/7
+// Start session — Pocket Option WebSocket, no IP blocks, 24/7
 async function startSession() {
   try {
     session = new QXSession({ onTick: processTick });
     await session.start();
-    await tgSend('✅ RafiX Signal Server LIVE!\nMonitoring 15 pairs via Twelve Data API\nWorks 24/7 — no PC needed!');
+    await tgSend('✅ RafiX Signal Server LIVE!\n📡 Pocket Option WebSocket connected\n15 OTC pairs — works 24/7 without PC!');
   } catch(e) {
     console.error('[Session] Error:', e.message);
     session = null;
-    setTimeout(startSession, 60000);
+    setTimeout(startSession, 30000);
   }
 }
 
