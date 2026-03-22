@@ -80,10 +80,38 @@ class QXSession {
       if (msg === '2') { this.ws?.send('3'); return; }
 
       // Log first 3 unique event types to understand format
-      if (this.tickCount === 0 && msg.startsWith('42')) {
-        console.log(`[QX-WS] RAW: ${msg.slice(0, 300)}`);
+      if (this.tickCount === 0 && msg.length > 2) {
+        console.log('[QX-WS] RAW: ' + msg.slice(0, 300));
       }
-
+      // Handle 451- multi-packet (instruments/list, ticks)
+      if (msg.startsWith('451-')) {
+        try {
+          const payload = JSON.parse(msg.slice(4));
+          if (!Array.isArray(payload)) return;
+          const event = payload[0], data = payload[1];
+          if (event === 'instruments/list' && Array.isArray(data)) {
+            data.forEach(inst => {
+              if (!Array.isArray(inst)) return;
+              const sym = inst[1];
+              if (!sym || !sym.includes('_otc')) return;
+              for (let i = 3; i < Math.min(inst.length, 20); i++) {
+                const p = parseFloat(inst[i]);
+                if (p > 0.0001 && p < 1000000 && !isNaN(p)) {
+                  if (this.onTick) this.onTick(sym, p, Date.now());
+                  this.tickCount++; break;
+                }
+              }
+            });
+            console.log('[QX-WS] instruments/list — ' + this.tickCount + ' prices');
+          }
+          if (['tick','price','quote'].includes(event) && data) {
+            const sym = data.asset || data.symbol;
+            const price = parseFloat(data.price || data.value);
+            if (sym && price > 0 && this.onTick) { this.onTick(sym, price, Date.now()); this.tickCount++; }
+          }
+        } catch(e) {}
+        return;
+      }
       if (!msg.startsWith('42')) return;
 
       // QX uses two formats:
