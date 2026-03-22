@@ -100,7 +100,7 @@ function runLoop() {
 
   ALL_PAIRS.forEach(sym => {
     const hist = candles[sym] || [];
-    if (hist.length < 20) return;
+    if (hist.length < 5) return;
 
     const tks = liveTicks[sym] || [];
     const live = tks.length > 0 ? {
@@ -146,7 +146,7 @@ function runLoop() {
 
   // Show pairs scoring 20+ (was 40 — lowered so Asian session pairs show)
   const active = Object.values(updates)
-    .filter(p => p.quality >= 20)
+    .filter(p => p.quality >= 5)
     .sort((a, b) => b.quality - a.quality)
     .slice(0, 4);
 

@@ -71,6 +71,13 @@ class QXSession {
     });
     this.ws.send(`42["tick/subscribe",{}]`);
     console.log(`[QX-WS] Subscribed to ${ALL_PAIRS.length} pairs`);
+    // Re-request instruments/list every 90s to keep prices fresh
+    clearInterval(this._listInterval);
+    this._listInterval = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send('42["instruments/list",{}]');
+      }
+    }, 90000);
   }
 
   _handle(msg) {
