@@ -264,7 +264,7 @@ async function startSession() {
 }
 
 // Boot
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8080;
 server.listen(PORT, async () => {
   console.log(`[Server] Running on port ${PORT}`);
   pollTelegram();
