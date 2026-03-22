@@ -169,6 +169,20 @@ wss.on('connection', (ws, req) => {
 });
 
 // HTTP — health + admin (verify code input page)
+// Accept tick data pushed from Chrome extension
+app.use(express.json());
+app.post('/push', (req, res) => {
+  try {
+    const { ticks } = req.body;
+    if (Array.isArray(ticks)) {
+      ticks.forEach(({ sym, price, ts }) => {
+        if (sym && price) processTick(sym, parseFloat(price), ts || Date.now());
+      });
+    }
+    res.json({ ok: true, received: ticks?.length || 0 });
+  } catch(e) { res.json({ ok: false }); }
+});
+
 app.get('/', (req, res) => res.json({
   ok: true, pairs: ALL_PAIRS.length,
   clients: wss.clients.size,
@@ -229,11 +243,11 @@ async function pollTelegram() {
   }
 }
 
-// Start session — pure WebSocket with token, no Puppeteer
+// Start session — try WebSocket first, extension push is the fallback
 async function startSession() {
   if (!QX_TOKEN) {
-    console.log('[Server] No QX_TOKEN set — add it in Railway env vars');
-    await tgSend('⚠️ RafiX Server: QX_TOKEN not set. Add it in Railway → Variables → QX_TOKEN');
+    console.log('[Server] No QX_TOKEN — waiting for extension push data');
+    await tgSend('✅ RafiX Signal Server LIVE!\nWaiting for Chrome extension to push data.\nMake sure the extension is running on QX.');
     return;
   }
   try {
@@ -241,17 +255,15 @@ async function startSession() {
       token: QX_TOKEN,
       onTick: processTick,
       onDisconnect: async () => {
-        console.log('[Session] Disconnected — restarting in 15s');
         session = null;
-        setTimeout(startSession, 15000);
+        setTimeout(startSession, 60000);
       }
     });
     await session.start();
-    await tgSend('✅ RafiX Signal Server is LIVE!\nMonitoring ' + ALL_PAIRS.length + ' OTC pairs 24/7\nNo login required — direct WebSocket connection');
+    await tgSend('✅ RafiX Signal Server LIVE! Direct WebSocket connected.');
   } catch(e) {
     console.error('[Session] Error:', e.message);
     session = null;
-    setTimeout(startSession, 30000);
   }
 }
 
