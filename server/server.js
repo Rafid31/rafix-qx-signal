@@ -259,7 +259,7 @@ async function startSession() {
   } catch(e) {
     console.error('[Session] Error:', e.message);
     session = null;
-    setTimeout(startSession, 60000);
+    setTimeout(startSession, 120000); // wait 2 min before retry
   }
 }
 

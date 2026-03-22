@@ -61,19 +61,52 @@ class QXSession {
 
   async _login() {
     console.log('[QX] Navigating to sign-in...');
-    await this.page.goto('https://qxbroker.com/en/sign-in', { waitUntil: 'networkidle2', timeout: 30000 });
+    await this.page.goto('https://qxbroker.com/en/sign-in', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    // Extra wait for JS to render the form
+    await new Promise(r => setTimeout(r, 5000));
 
-    // Fill email
-    await this.page.waitForSelector('input[type="email"]', { timeout: 15000 });
-    await this.page.click('input[type="email"]');
-    await this.page.type('input[type="email"]', this.email, { delay: 40 });
+    // Try multiple selectors for email field
+    const emailSelectors = ['input[type="email"]', 'input[name="email"]', 'input[placeholder*="mail" i]', 'input[class*="email" i]', 'form input:first-of-type'];
+    let emailFilled = false;
+    for (const sel of emailSelectors) {
+      try {
+        await this.page.waitForSelector(sel, { timeout: 8000 });
+        await this.page.click(sel);
+        await this.page.type(sel, this.email, { delay: 60 });
+        emailFilled = true;
+        console.log('[QX] Email filled using selector:', sel);
+        break;
+      } catch(e) { continue; }
+    }
+    if (!emailFilled) {
+      // Last resort: use JS to fill
+      await this.page.evaluate((email) => {
+        const inputs = document.querySelectorAll('input');
+        for (const inp of inputs) {
+          if (inp.type === 'email' || inp.name === 'email' || inp.placeholder?.toLowerCase().includes('mail')) {
+            inp.value = email;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            inp.dispatchEvent(new Event('change', { bubbles: true }));
+            break;
+          }
+        }
+      }, this.email);
+    }
 
     // Fill password
-    await this.page.click('input[type="password"]');
-    await this.page.type('input[type="password"]', this.pass, { delay: 40 });
+    const passSels = ['input[type="password"]', 'input[name="password"]'];
+    for (const sel of passSels) {
+      try {
+        await this.page.waitForSelector(sel, { timeout: 5000 });
+        await this.page.click(sel);
+        await this.page.type(sel, this.pass, { delay: 60 });
+        break;
+      } catch(e) { continue; }
+    }
     await this.page.keyboard.press('Enter');
 
-    await this.page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+    await this.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    await new Promise(r => setTimeout(r, 3000));
 
     // Check if verification code page appeared
     const url = this.page.url();
@@ -103,7 +136,8 @@ class QXSession {
     }
 
     // Navigate to demo trade page
-    await this.page.goto('https://qxbroker.com/en/demo-trade', { waitUntil: 'networkidle2', timeout: 30000 });
+    await this.page.goto('https://qxbroker.com/en/demo-trade', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await new Promise(r => setTimeout(r, 5000));
     console.log('[QX] Logged in. URL:', this.page.url());
   }
 
