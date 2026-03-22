@@ -1,5 +1,4 @@
-// RafiX QX Signal Server v1.0
-// Railway 24/7 — Puppeteer reads real QX OTC data, all pairs, weekends
+// RafiX QX Signal Server v5 — Twelve Data API (24/7, no PC needed)
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const http = require('http');
@@ -250,27 +249,16 @@ async function pollTelegram() {
   }
 }
 
-// Start session — try WebSocket first, extension push is the fallback
+// Start session — Twelve Data API, no login, 24/7
 async function startSession() {
-  if (!QX_TOKEN) {
-    console.log('[Server] No QX_TOKEN — waiting for extension push data');
-    await tgSend('✅ RafiX Signal Server LIVE!\nWaiting for Chrome extension to push data.\nMake sure the extension is running on QX.');
-    return;
-  }
   try {
-    session = new QXSession({
-      token: QX_TOKEN,
-      onTick: processTick,
-      onDisconnect: async () => {
-        session = null;
-        setTimeout(startSession, 60000);
-      }
-    });
+    session = new QXSession({ onTick: processTick });
     await session.start();
-    await tgSend('✅ RafiX Signal Server LIVE! Direct WebSocket connected.');
+    await tgSend('✅ RafiX Signal Server LIVE!\nMonitoring 15 pairs via Twelve Data API\nWorks 24/7 — no PC needed!');
   } catch(e) {
     console.error('[Session] Error:', e.message);
     session = null;
+    setTimeout(startSession, 60000);
   }
 }
 
