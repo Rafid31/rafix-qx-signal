@@ -1,4 +1,5 @@
-// QX Session v4 — Pure WebSocket with correct message parsing
+// QX Session v4 — Pure WebSocket, NO Puppeteer
+// Connects directly to QX WebSocket using browser session token
 const WebSocket = require('ws');
 
 const ALL_PAIRS = [
@@ -64,13 +65,10 @@ class QXSession {
 
   _subscribe() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    // Request instruments list — QX sends all pair data in response
     this.ws.send('42["instruments/list",{}]');
-    // Subscribe to real-time candles for each pair
     ALL_PAIRS.forEach(sym => {
       this.ws.send(`42["chart/subscribe",{"asset":"${sym}","period":60}]`);
     });
-    // Subscribe to real-time tick stream
     this.ws.send(`42["tick/subscribe",{}]`);
     console.log(`[QX-WS] Subscribed to ${ALL_PAIRS.length} pairs`);
   }
@@ -79,60 +77,48 @@ class QXSession {
     try {
       if (msg === '2') { this.ws?.send('3'); return; }
 
-      // Log first 3 unique event types to understand format
-      if (this.tickCount === 0 && msg.length > 2) {
-        console.log('[QX-WS] RAW: ' + msg.slice(0, 300));
-      }
-      // Handle 451- multi-packet (instruments/list, ticks)
+      // Handle 451- multi-packet (instruments/list etc)
       if (msg.startsWith('451-')) {
-        try {
-          const payload = JSON.parse(msg.slice(4));
-          if (!Array.isArray(payload)) return;
-          const event = payload[0], data = payload[1];
-          if (event === 'instruments/list' && Array.isArray(data)) {
-            data.forEach(inst => {
-              if (!Array.isArray(inst)) return;
-              const sym = inst[1];
-              if (!sym || !sym.includes('_otc')) return;
-              for (let i = 3; i < Math.min(inst.length, 20); i++) {
-                const p = parseFloat(inst[i]);
-                if (p > 0.0001 && p < 1000000 && !isNaN(p)) {
-                  if (this.onTick) this.onTick(sym, p, Date.now());
-                  this.tickCount++; break;
-                }
-              }
-            });
-            console.log('[QX-WS] instruments/list — ' + this.tickCount + ' prices');
-          }
-          if (['tick','price','quote'].includes(event) && data) {
-            const sym = data.asset || data.symbol;
-            const price = parseFloat(data.price || data.value);
-            if (sym && price > 0 && this.onTick) { this.onTick(sym, price, Date.now()); this.tickCount++; }
-          }
-        } catch(e) {}
+        const payload = JSON.parse(msg.slice(4));
+        if (!Array.isArray(payload)) return;
+        const event = payload[0];
+        const data = payload[1];
+
+        if (event === 'instruments/list' && Array.isArray(data)) {
+          let extracted = 0;
+          data.forEach(inst => {
+            if (!Array.isArray(inst)) return;
+            const sym = inst[1];
+            if (!sym || !sym.includes('_otc')) return;
+            // From logs: [id,sym,name,type,?,payout,period,?,?,?,?,?,[],timestamp,bool,[candles],?,PRICE,...]
+            // Index 17 confirmed as price from log: "4,38,60,30,3,1,0,0,[],ts,true,[],10,3.95"
+            const price = parseFloat(inst[17]) || parseFloat(inst[16]) || parseFloat(inst[18]);
+            if (price > 0 && price < 1000000) {
+              if (this.onTick) this.onTick(sym, price, Date.now());
+              this.tickCount++;
+              extracted++;
+            }
+          });
+          if (extracted > 0) console.log(`[QX-WS] instruments/list — ${extracted} prices ✅`);
+        }
+
+        if (['tick','price','quote'].includes(event) && data) {
+          const sym = data.asset || data.symbol;
+          const price = parseFloat(data.price || data.value);
+          if (sym && price > 0 && this.onTick) { this.onTick(sym, price, Date.now()); this.tickCount++; }
+        }
         return;
       }
+
       if (!msg.startsWith('42')) return;
-
-      // QX uses two formats:
-      // Format A: 42["event", {object}]
-      // Format B: 451-["event", [array of data]]  (multi-packet)
-      let payload;
-      if (msg.startsWith('451-')) {
-        payload = JSON.parse(msg.slice(4));
-      } else {
-        payload = JSON.parse(msg.slice(2));
-      }
-
+      const payload = JSON.parse(msg.slice(2));
       if (!Array.isArray(payload) || payload.length < 2) return;
       const event = payload[0];
       const data = payload[1];
 
-      // ── TICK / PRICE events ──────────────────────────────────
-      if (event === 'tick' || event === 'price' || event === 'tick/price') {
-        // Format: { asset: "EURUSD_otc", price: 1.1050, time: 1234567 }
-        const sym = data.asset || data.symbol;
-        const price = parseFloat(data.price || data.value);
+      if (['tick','price','quote/price','instruments/update','chart/update'].includes(event)) {
+        const sym = data.asset || data.symbol || data.id;
+        const price = parseFloat(data.price || data.value || data.close);
         const ts = data.time ? (data.time > 1e10 ? data.time : data.time * 1000) : Date.now();
         if (sym && price > 0 && this.onTick) {
           this.onTick(sym, price, ts);
@@ -140,52 +126,6 @@ class QXSession {
           if (this.tickCount % 500 === 1) console.log(`[QX-WS] ${this.tickCount} ticks — ${sym}: ${price}`);
         }
       }
-
-      // ── INSTRUMENTS LIST (contains current prices) ───────────
-      // Format B: 451-["instruments/list", [array of instruments]]
-      // Each instrument: [id, symbol, name, type, ...]
-      if (event === 'instruments/list' && Array.isArray(data)) {
-        data.forEach(inst => {
-          if (!Array.isArray(inst)) return;
-          // inst[1] = symbol, inst[14] might be last price
-          const sym = inst[1];
-          if (!sym || !sym.includes('_otc')) return;
-          // Look for price in the array
-          const price = parseFloat(inst[14] || inst[5] || inst[4] || 0);
-          if (price > 0 && this.onTick) {
-            this.onTick(sym, price, Date.now());
-            this.tickCount++;
-          }
-        });
-        if (this.tickCount > 0) console.log(`[QX-WS] instruments/list: got ${this.tickCount} prices`);
-      }
-
-      // ── CHART / CANDLE DATA ──────────────────────────────────
-      if (event === 'chart/update' || event === 'candle' || event === 'chart/candle') {
-        const sym = data.asset || data.symbol;
-        const price = parseFloat(data.close || data.price || data.value);
-        const ts = data.time ? (data.time > 1e10 ? data.time : data.time * 1000) : Date.now();
-        if (sym && price > 0 && this.onTick) {
-          this.onTick(sym, price, ts);
-          this.tickCount++;
-        }
-      }
-
-      // ── HISTORY CANDLES (batch) ──────────────────────────────
-      if (event === 'history/candles' || event === 'candle/history') {
-        const sym = data.asset || data.symbol;
-        const candles = data.candles || data.data || [];
-        if (sym && candles.length > 0) {
-          candles.forEach(c => {
-            const price = parseFloat(c.close || c.c);
-            const ts = (c.time || c.t || 0);
-            const timestamp = ts > 1e10 ? ts : ts * 1000;
-            if (price > 0 && this.onTick) this.onTick(sym, price, timestamp || Date.now());
-          });
-          console.log(`[QX-WS] ${candles.length} history candles for ${sym}`);
-        }
-      }
-
     } catch(e) {}
   }
 
