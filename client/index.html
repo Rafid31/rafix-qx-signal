@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>RafiX Signal Pro — OTC Live</title>
+<style>
+:root{--bg:#040810;--card:#070d1a;--border:#0f1f35;--green:#00ff88;--red:#ff2d55;--yellow:#ffcc00;--cyan:#00e5ff;--purple:#8855ff;--text:#e8f4ff;--muted:#4a6a8a}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,system-ui,sans-serif;min-height:100vh}
+header{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:100}
+.logo{display:flex;align-items:center;gap:10px}
+.logo-icon{width:30px;height:30px;border-radius:7px;background:linear-gradient(135deg,var(--green),var(--cyan));display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:900;color:#000}
+.logo-name{font-size:14px;font-weight:800}.logo-sub{font-size:7px;letter-spacing:2px;color:var(--muted)}
+.hdr-right{display:flex;align-items:center;gap:10px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
+.dot.live{background:var(--green);animation:blink 2s infinite}
+.dot.err{background:var(--red)}
+.sbadge{font-size:8px;font-weight:700;letter-spacing:1px;padding:3px 7px;border-radius:4px}
+.sbadge.best{background:rgba(255,204,0,.15);color:var(--yellow)}
+.sbadge.good{background:rgba(0,255,136,.1);color:var(--green)}
+.sbadge.slow{background:rgba(255,45,85,.1);color:var(--red)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+/* Timer */
+.tbar{display:flex;align-items:center;gap:10px;padding:8px 18px;background:var(--card);border-bottom:1px solid var(--border)}
+.tlbl{font-size:8px;letter-spacing:1px;color:var(--muted);width:78px;flex-shrink:0}
+.ttrack{flex:1;height:4px;background:rgba(255,255,255,.06);border-radius:2px;overflow:hidden}
+.tfill{height:100%;border-radius:2px;transition:width .9s linear,background .3s}
+.tnum{font-family:monospace;font-size:14px;font-weight:800;min-width:34px;text-align:right}
+.tnum.ok{color:var(--text)}.tnum.warn{color:var(--yellow)}.tnum.hot{color:var(--red);animation:blink .4s infinite}
+/* Banner */
+.banner{display:none;text-align:center;padding:9px;font-size:11px;font-weight:900;letter-spacing:1.5px}
+.banner.show{display:block}
+.banner.prep{background:rgba(255,204,0,.1);color:var(--yellow)}
+.banner.buy{background:rgba(0,255,136,.15);color:var(--green);animation:gb .5s infinite}
+.banner.sell{background:rgba(255,45,85,.15);color:var(--red);animation:rs .5s infinite}
+@keyframes gb{0%,100%{box-shadow:none}50%{box-shadow:0 0 25px rgba(0,255,136,.35)}}
+@keyframes rs{0%,100%{box-shadow:none}50%{box-shadow:0 0 25px rgba(255,45,85,.35)}}
+/* Stats */
+.stats{display:flex;gap:14px;flex-wrap:wrap;padding:8px 18px;background:var(--card);border-bottom:1px solid var(--border);font-size:8px;color:var(--muted)}
+.sv{color:var(--text);font-weight:700;font-family:monospace}
+/* Main */
+.main{padding:14px 14px 60px;max-width:940px;margin:0 auto}
+.sec-title{font-size:8px;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin:14px 0 8px}
+/* Grid */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+/* Card */
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:13px;transition:border-color .3s,background .3s}
+.card.buy{border-color:rgba(0,255,136,.4);background:rgba(0,255,136,.03)}
+.card.sell{border-color:rgba(255,45,85,.4);background:rgba(255,45,85,.03)}
+.card.lean{border-color:rgba(255,204,0,.2)}
+.card.fb{animation:gb .7s infinite}.card.fs{animation:rs .7s infinite}
+.ch{display:flex;justify-content:space-between;align-items:center;margin-bottom:7px}
+.cname{font-size:12px;font-weight:800}
+.cq{font-size:7px;font-weight:700;letter-spacing:1px;padding:2px 6px;border-radius:4px}
+.cprice{font-size:15px;font-weight:900;font-family:monospace;color:var(--cyan);margin-bottom:8px}
+.sbox{display:flex;align-items:center;gap:7px;border-radius:8px;padding:9px 11px;margin-bottom:6px;border:1px solid var(--border)}
+.sbox.buy{background:rgba(0,255,136,.1);border-color:rgba(0,255,136,.35)}
+.sbox.sell{background:rgba(255,45,85,.1);border-color:rgba(255,45,85,.35)}
+.sbox.wait{background:rgba(255,255,255,.03)}
+.sbox.lean{background:rgba(255,204,0,.07);border-color:rgba(255,204,0,.2)}
+.sicon{font-size:20px;flex-shrink:0}.stxt{flex:1}
+.smain{font-size:12px;font-weight:800}
+.smain.buy{color:var(--green)}.smain.sell{color:var(--red)}.smain.wait{color:var(--muted);font-size:10px}.smain.lean{color:var(--yellow);font-size:10px}
+.ssub{font-size:8px;color:var(--muted);margin-top:1px}
+.sscore{font-family:monospace;font-size:11px;font-weight:700;padding:2px 7px;border-radius:4px;background:rgba(255,255,255,.06);color:#7a9ab8;flex-shrink:0}
+.sscore.buy{background:rgba(0,255,136,.15);color:var(--green)}.sscore.sell{background:rgba(255,45,85,.15);color:var(--red)}
+.wbox{font-size:8px;font-weight:700;padding:4px 8px;border-radius:5px;margin-bottom:6px;text-align:center;display:none}
+.wbox.show{display:block}
+.wbox.dn{background:rgba(255,45,85,.08);border:1px solid rgba(255,45,85,.3);color:#ff6b85}
+.wbox.up{background:rgba(0,255,136,.08);border:1px solid rgba(0,255,136,.3);color:#0c6}
+.wbox.n{background:rgba(255,204,0,.08);border:1px solid rgba(255,204,0,.25);color:var(--yellow)}
+/* Bars */
+.brow{display:flex;align-items:center;gap:5px;margin-bottom:3px}
+.blbl{font-size:7px;letter-spacing:1px;color:var(--muted);width:24px}
+.btrack{flex:1;height:3px;background:rgba(255,255,255,.05);border-radius:2px;overflow:hidden}
+.bfill{height:100%;border-radius:2px;transition:width .8s ease}
+.bfill.b{background:linear-gradient(90deg,rgba(0,255,136,.3),var(--green))}
+.bfill.s{background:linear-gradient(90deg,rgba(255,45,85,.3),var(--red))}
+.bnum{font-family:monospace;font-size:8px;color:#7a9ab8;min-width:20px;text-align:right}
+/* Ind grid */
+.igrid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px 5px;margin-top:6px;border-top:1px solid var(--border);padding-top:6px}
+.irow{display:flex;align-items:center;justify-content:space-between}
+.in{font-size:7px;color:var(--muted)}.iv{font-size:9px;font-weight:800}
+.iv.up{color:var(--green)}.iv.dn{color:var(--red)}.iv.n{color:#2d4060}
+.cfoot{display:flex;justify-content:space-between;font-size:7px;color:var(--muted);margin-top:6px;padding-top:5px;border-top:1px solid var(--border)}
+/* Empty/connecting */
+.empty,.conn{text-align:center;padding:50px 20px;display:none}
+.empty.show,.conn.show{display:block}
+.empty h3{font-size:15px;color:var(--muted);margin-bottom:8px}.empty p{font-size:11px;color:#2d4060;line-height:1.6}
+.conn p{font-size:13px;color:var(--muted)}
+@media(max-width:480px){.grid{grid-template-columns:1fr}.main{padding:10px 10px 50px}}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">
+    <div class="logo-icon">RX</div>
+    <div><div class="logo-name">RafiX Signal Pro</div><div class="logo-sub">OTC LIVE SIGNALS</div></div>
+  </div>
+  <div class="hdr-right">
+    <span class="sbadge" id="sBadge">—</span>
+    <div class="dot" id="dot"></div>
+    <span style="font-size:9px;color:var(--muted)" id="sText">Connecting...</span>
+  </div>
+</header>
+<div class="tbar">
+  <span class="tlbl">NEXT CANDLE</span>
+  <div class="ttrack"><div class="tfill" id="tFill" style="width:100%;background:var(--green)"></div></div>
+  <span class="tnum ok" id="tNum">--s</span>
+</div>
+<div class="banner" id="banner"></div>
+<div class="stats">
+  <span>📡 Monitoring: <span class="sv" id="stMon">--</span></span>
+  <span>✅ Active: <span class="sv" id="stAct">--</span></span>
+  <span>🔌 Server: <span class="sv" id="stSrv">--</span></span>
+  <span>⏱ <span class="sv" id="stUp">0s</span></span>
+</div>
+<div class="main">
+  <div class="conn show" id="conn"><div style="font-size:28px;margin-bottom:12px">📡</div><p>Connecting to signal server...</p></div>
+  <div class="sec-title" id="secTitle" style="display:none">ACTIVE PAIRS — BEST SIGNALS NOW</div>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty">
+    <h3>No tradeable pairs right now</h3>
+    <p>All pairs are in low-quality condition.<br>Usually during Asian session (04:00–12:00 Dubai).<br><br>Best trading hours:<br>🌟 17:00–20:00 Dubai = London+NY overlap<br>✅ 12:00–17:00 Dubai = London<br>✅ 20:00–22:00 Dubai = New York</p>
+  </div>
+</div>
+<script>
+// ── CONFIG — update this after Railway deploy ──────────────────
+const WS_URL = window.location.hostname === 'localhost'
+  ? 'ws://localhost:3001'
+  : 'wss://YOUR-RAILWAY-URL.up.railway.app'; // ← UPDATE THIS
+
+let ws, cards = {}, start = Date.now();
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => {
+    setDot('live','LIVE');
+    document.getElementById('conn').classList.remove('show');
+    document.getElementById('secTitle').style.display = 'block';
+  };
+  ws.onmessage = e => {
+    try { handle(JSON.parse(e.data)); } catch(_) {}
+  };
+  ws.onclose = () => { setDot('err','OFFLINE'); setTimeout(connect, 3000); };
+  ws.onerror = () => setDot('err','ERROR');
+}
+
+function handle(d) {
+  if (d.type === 'UPDATE') {
+    timer(d.secondsLeft);
+    banner(d);
+    pairs(d.activePairs || []);
+    document.getElementById('stMon').textContent = d.totalMonitored || '--';
+    document.getElementById('stAct').textContent = d.activePairs?.length || 0;
+    document.getElementById('stSrv').textContent = d.serverStatus || '--';
+    sessionBadge();
+  }
+}
+
+function timer(rem) {
+  const f = document.getElementById('tFill'), n = document.getElementById('tNum');
+  if (!f || !n) return;
+  f.style.width = Math.max(0,(rem/60)*100) + '%';
+  f.style.background = rem<=5?'var(--red)':rem<=15?'var(--yellow)':'var(--green)';
+  n.textContent = rem + 's';
+  n.className = 'tnum ' + (rem<=5?'hot':rem<=15?'warn':'ok');
+}
+
+function banner(d) {
+  const b = document.getElementById('banner');
+  const rem = d.secondsLeft;
+  const ap = d.activePairs || [];
+  const hasSig = ap.some(p => p.signal==='BUY'||p.signal==='SELL');
+  if (!hasSig || rem <= 0) { b.className = 'banner'; return; }
+  if (rem <= 5) {
+    const buys = ap.filter(p=>p.signal==='BUY').length;
+    const sells = ap.filter(p=>p.signal==='SELL').length;
+    b.className = 'banner show ' + (buys>=sells?'buy':'sell');
+    b.textContent = `🔴 ${rem}s — ENTER ${buys>=sells?'BUY':'SELL'} NOW`;
+  } else if (rem <= 15) {
+    b.className = 'banner show prep';
+    b.textContent = `⚡ ${rem}s — Prepare to enter on next candle open`;
+  } else { b.className = 'banner'; }
+}
+
+function pairs(ap) {
+  const grid = document.getElementById('grid');
+  const empty = document.getElementById('empty');
+  if (!ap.length) { grid.innerHTML=''; cards={}; empty.classList.add('show'); return; }
+  empty.classList.remove('show');
+  // Remove stale
+  Object.keys(cards).forEach(sym => { if(!ap.find(p=>p.sym===sym)){cards[sym].remove();delete cards[sym];}});
+  ap.forEach(p => {
+    if (!cards[p.sym]) { const c = mkCard(); grid.appendChild(c); cards[p.sym] = c; }
+    updCard(cards[p.sym], p);
+  });
+}
+
+function mkCard() {
+  const d = document.createElement('div');
+  d.className = 'card';
+  d.innerHTML = `
+    <div class="ch"><span class="cname" df="name">--</span><span class="cq" df="q">--</span></div>
+    <div class="cprice" df="price">--</div>
+    <div class="sbox wait" df="sbox">
+      <span class="sicon" df="icon">⏳</span>
+      <div class="stxt"><div class="smain wait" df="smain">SCANNING</div><div class="ssub" df="ssub">loading...</div></div>
+      <span class="sscore" df="sscore">0/6</span>
+    </div>
+    <div class="wbox" df="warn"></div>
+    <div class="brow"><span class="blbl">BUY</span><div class="btrack"><div class="bfill b" df="bbar" style="width:0%"></div></div><span class="bnum" df="bnum">0/6</span></div>
+    <div class="brow"><span class="blbl">SELL</span><div class="btrack"><div class="bfill s" df="sbar" style="width:0%"></div></div><span class="bnum" df="snum">0/6</span></div>
+    <div class="igrid">
+      <div class="irow"><span class="in">RSI</span><span class="iv n" df="irsi">—</span></div>
+      <div class="irow"><span class="in">EMA</span><span class="iv n" df="iema">—</span></div>
+      <div class="irow"><span class="in">MACD</span><span class="iv n" df="imacd">—</span></div>
+      <div class="irow"><span class="in">CDL</span><span class="iv n" df="icdl">—</span></div>
+      <div class="irow"><span class="in">TREND</span><span class="iv n" df="itrend">—</span></div>
+      <div class="irow"><span class="in">MOM</span><span class="iv n" df="imom">—</span></div>
+    </div>
+    <div class="cfoot">
+      <span df="streak">neutral</span>
+      <span df="cc">--c</span>
+      <span>ADX <span df="adx">--</span></span>
+    </div>`;
+  return d;
+}
+
+function f(c,k){return c.querySelector(`[df="${k}"]`);}
+function av(v){return v==='up'?'▲':v==='dn'?'▼':'—';}
+function ac(v){return 'iv '+(v==='up'?'up':v==='dn'?'dn':'n');}
+
+function updCard(card, p) {
+  const sig = (p.isSignalWindow && p.earlyDir) ? p.earlyDir : p.signal;
+  const isSig = sig==='BUY'||sig==='SELL';
+  const urgent = p.isUrgent && isSig;
+
+  card.className = 'card'+(isSig?' '+sig.toLowerCase():'')+(p.signal==='LEAN'?' lean':'')+(urgent?' f'+sig.toLowerCase()[0]:'');
+
+  const q = p.quality;
+  const qTxt = q>=80?'EXCELLENT':q>=60?'GOOD':'OK';
+  const qClr = q>=80?'rgba(0,255,136,.12)':q>=60?'rgba(127,255,0,.1)':'rgba(255,204,0,.1)';
+  const qTClr = q>=80?'var(--green)':q>=60?'#7fff00':'var(--yellow)';
+  const qEl = f(card,'q');
+  if(qEl){qEl.textContent=qTxt;qEl.style.background=qClr;qEl.style.color=qTClr;}
+
+  const ne = f(card,'name'); if(ne) ne.textContent = p.label||p.sym;
+  const pr = f(card,'price'); if(pr) pr.textContent = p.price?p.price.toFixed(5):'--';
+
+  const sb = f(card,'sbox'); if(sb) sb.className='sbox '+(isSig?sig.toLowerCase():p.signal==='LEAN'?'lean':'wait');
+  const ic = f(card,'icon'); if(ic) ic.textContent=sig==='BUY'?'▲':sig==='SELL'?'▼':p.signal==='LEAN'?'↗':'⏳';
+
+  const sm = f(card,'smain');
+  if(sm){
+    sm.className='smain '+(isSig?sig.toLowerCase():p.signal==='LEAN'?'lean':'wait');
+    sm.textContent = isSig?(sig==='BUY'?'BUY — CALL ↑':'SELL — PUT ↓'):p.signal==='LEAN'?`LEAN ${p.earlyDir}`:p.blocked?p.blockReason:`WAIT — ${p.score}/${p.maxScore} votes`;
+  }
+  const ss = f(card,'ssub');
+  if(ss) ss.textContent = isSig&&p.isSignalWindow?(p.isUrgent?`🔴 ENTER ON NEXT CANDLE!`:`⚡ ${p.secondsLeft}s — prepare`):(isSig?'Enter on NEXT candle open':`${p.candleCount}c · ${p.score}/6`);
+
+  const sc = f(card,'sscore'); if(sc){sc.textContent=p.score+'/6';sc.className='sscore'+(isSig?' '+sig.toLowerCase():'');}
+
+  const wb = f(card,'warn');
+  if(wb){if(p.warnMsg&&!isSig){wb.className='wbox show '+(p.warnMsg.includes('green')?'dn':p.warnMsg.includes('red')?'up':'n');wb.textContent=p.warnMsg;}else wb.className='wbox';}
+
+  const ind = p.indicators||{};
+  const vU = Object.values(ind).filter(v=>v==='up').length;
+  const vD = Object.values(ind).filter(v=>v==='dn').length;
+  const bb=f(card,'bbar');if(bb)bb.style.width=(vU/6*100)+'%';
+  const sb2=f(card,'sbar');if(sb2)sb2.style.width=(vD/6*100)+'%';
+  const bn=f(card,'bnum');if(bn)bn.textContent=vU+'/6';
+  const sn=f(card,'snum');if(sn)sn.textContent=vD+'/6';
+
+  [['rsi','irsi'],['ema','iema'],['macd','imacd'],['candle','icdl'],['trend','itrend'],['momentum','imom']].forEach(([k,fk])=>{
+    const el=f(card,fk);if(el){el.textContent=av(ind[k]);el.className=ac(ind[k]);}
+  });
+
+  const st=f(card,'streak');if(st)st.textContent=p.streak||'neutral';
+  const cc=f(card,'cc');if(cc)cc.textContent=(p.candleCount||'--')+'c';
+  const adxEl=f(card,'adx');if(adxEl)adxEl.textContent=p.adx||'--';
+}
+
+function setDot(state,txt){
+  document.getElementById('dot').className='dot '+state;
+  document.getElementById('sText').textContent=txt;
+}
+
+function sessionBadge(){
+  const b=document.getElementById('sBadge');
+  const h=new Date(Date.now()+4*3600000).getUTCHours();
+  if(h>=17&&h<20){b.className='sbadge best';b.textContent='LDN+NY ★';}
+  else if(h>=12&&h<22){b.className='sbadge good';b.textContent=h<17?'LONDON':'NEW YORK';}
+  else{b.className='sbadge slow';b.textContent='ASIAN ⚠️';}
+}
+
+setInterval(()=>{
+  const s=Math.floor((Date.now()-start)/1000);
+  document.getElementById('stUp').textContent=s<60?s+'s':Math.floor(s/60)+'m'+(s%60)+'s';
+  sessionBadge();
+},1000);
+
+connect();
+</script>
+</body>
+</html>
