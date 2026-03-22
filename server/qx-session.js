@@ -65,17 +65,30 @@ class QXSession {
 
   _subscribe() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-    ALL_PAIRS.forEach(sym => {
-      this.ws.send(`42["history/generate",{"asset":"${sym}","period":60,"count":250}]`);
-      this.ws.send(`42["instruments/update",{"asset":"${sym}","period":60}]`);
-    });
-    this.ws.send(`42["quote/subscribe",{"assets":${JSON.stringify(ALL_PAIRS)}}]`);
-    console.log(`[QX-WS] Subscribed to ${ALL_PAIRS.length} pairs`);
+    // Send Socket.IO connect to namespace
+    this.ws.send('40');
+    setTimeout(() => {
+      ALL_PAIRS.forEach(sym => {
+        // Request candle history
+        this.ws.send(`42["history/generate",{"asset":"${sym}","period":60,"count":200}]`);
+      });
+      // Subscribe to live quotes for all pairs
+      this.ws.send(`42["quote/subscribe",{"assets":${JSON.stringify(ALL_PAIRS)}}]`);
+      // Also try instruments subscription
+      ALL_PAIRS.forEach(sym => {
+        this.ws.send(`42["instruments/follow",{"asset":"${sym}"}]`);
+      });
+      console.log(`[QX-WS] Subscribed to ${ALL_PAIRS.length} pairs`);
+    }, 1000);
   }
 
   _handle(msg) {
     try {
       if (msg === '2') { this.ws?.send('3'); return; }
+      // Log ALL messages until we get first tick — to understand QX format
+      if (this.tickCount === 0) {
+        console.log(`[QX-WS] RAW: ${msg.slice(0, 200)}`);
+      }
       if (!msg.startsWith('42')) return;
       const payload = JSON.parse(msg.slice(2));
       const event = payload[0], data = payload[1];
