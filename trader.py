@@ -341,7 +341,7 @@ async def _ws_handler(ws, ssid: str):
                 _parse_binary(msg)
                 continue
 
-            log.debug("WS← %s", msg[:200])
+            log.info("WS← %s", msg[:200])
 
             if msg.startswith("0{") and "sid" in msg:
                 await ws.send("40")
@@ -367,9 +367,9 @@ async def _ws_handler(ws, ssid: str):
 
 async def _handle_sio_event(ws, event: str, data):
     """Dispatch a parsed Socket.IO event."""
-    log.debug("Event %-25s data=%s", event,
-              str(data)[:100] if not isinstance(data, dict)
-              else list(data.keys()))
+    log.info("EVT %-25s data=%s", event,
+             str(data)[:150] if not isinstance(data, dict)
+             else list(data.keys()))
     ev = event.lower()
 
     if ev in ("successauth", "success-auth"):
