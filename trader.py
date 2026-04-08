@@ -55,7 +55,7 @@ log = logging.getLogger("po_trader")
 # ══════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════
-VERSION        = "3.0.0"
+VERSION        = "3.1.0"
 POCKET_SSID    = os.environ.get("POCKET_SSID", "")
 POCKET_COOKIE  = os.environ.get("POCKET_COOKIE", "")
 POCKET_UID     = int(os.environ.get("POCKET_UID", "0"))
@@ -332,64 +332,137 @@ def _ssl_ctx():
 # ══════════════════════════════════════════════════════════
 
 async def _ws_handler(ws, ssid: str):
-    """Handle all incoming WS messages."""
+    """Handle all incoming WS messages from PocketOption."""
     sent_auth = False
 
     async for msg in ws:
         try:
             if isinstance(msg, bytes):
                 _parse_binary(msg)
-            elif msg.startswith("0{") and "sid" in msg:
+                continue
+
+            log.debug("WS← %s", msg[:200])
+
+            if msg.startswith("0{") and "sid" in msg:
                 await ws.send("40")
             elif msg == "2":
                 await ws.send("3")
-            elif msg.startswith("40{") and "sid" in msg and not sent_auth:
+            elif msg.startswith("40") and not sent_auth:
                 sent_auth = True
                 await ws.send(ssid)
                 log.info("SSID auth sent")
-            elif "updateAssets" in msg and not state["connected"]:
-                state["connected"] = True
-                log.info("✅ PO connected!")
-                await ws.send('42["sendMessage",{"name":"get-balances","version":"1.0"}]')
-                _broadcast()
-            elif "NotAuthorized" in msg:
-                log.error("❌ Not authorized — session expired")
-                state["error"]     = "Session expired. Update POCKET_SSID + POCKET_COOKIE."
-                state["connected"] = False
-                _broadcast()
+            elif msg.startswith("451-") or msg.startswith("42["):
+                try:
+                    json_str = msg[4:] if msg.startswith("451-") else msg[2:]
+                    arr = json.loads(json_str)
+                    if isinstance(arr, list) and arr:
+                        await _handle_sio_event(ws, str(arr[0]),
+                                                arr[1] if len(arr) > 1 else {})
+                except Exception as ep:
+                    log.debug("Event parse err: %s | raw=%s", ep, msg[:120])
+
         except Exception as e:
             log.error("WS msg error: %s", e)
 
 
-def _parse_binary(data: bytes):
-    try:
-        obj = json.loads(data.decode("utf-8", errors="replace"))
-        if isinstance(obj, dict):
-            if "balance" in obj and "uid" in obj:
-                state["balance"] = float(obj["balance"])
-                log.info("💰 Balance: $%.2f", state["balance"])
-                _broadcast()
-            # trade open confirmation
-            if obj.get("requestId") == "buy" or (
-                    isinstance(obj.get("requestId"), int) and "id" in obj):
-                tid = str(obj.get("id", obj.get("requestId", "")))
-                log.info("📋 Trade opened id=%s", tid)
-                if tid in pending_trades:
-                    pending_trades[tid]["opened"] = True
-        elif isinstance(obj, list):
-            for deal in obj:
-                if isinstance(deal, dict) and "profit" in deal:
+async def _handle_sio_event(ws, event: str, data):
+    """Dispatch a parsed Socket.IO event."""
+    log.debug("Event %-25s data=%s", event,
+              str(data)[:100] if not isinstance(data, dict)
+              else list(data.keys()))
+    ev = event.lower()
+
+    if ev in ("successauth", "success-auth"):
+        state["connected"] = True
+        if isinstance(data, dict):
+            _update_balance(data)
+        log.info("✅ PO auth success!")
+        await ws.send('42["sendMessage",{"name":"get-balances","version":"1.0"}]')
+        _broadcast()
+
+    elif ev == "updateassets" and not state["connected"]:
+        state["connected"] = True
+        log.info("✅ PO connected (updateAssets)!")
+        await ws.send('42["sendMessage",{"name":"get-balances","version":"1.0"}]')
+        _broadcast()
+
+    elif ev in ("notauthorized",) or (isinstance(data, str) and "notauthorized" in data.lower()):
+        log.error("❌ Not authorized — session expired")
+        state["error"]     = "Session expired. Update POCKET_SSID + POCKET_COOKIE."
+        state["connected"] = False
+        _broadcast()
+
+    elif ev in ("updatebalance", "updatebalances", "balances",
+                "successbalances", "balance"):
+        if isinstance(data, dict):
+            _update_balance(data)
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    _update_balance(item)
+
+    elif ev in ("openorder", "openorderv2", "successopenorder"):
+        if isinstance(data, dict):
+            tid = str(data.get("id", ""))
+            req = str(data.get("requestId", ""))
+            log.info("📋 Trade opened id=%s req=%s asset=%s",
+                     tid, req, data.get("asset", "?"))
+            if req in pending_trades and tid:
+                pending_trades[tid] = pending_trades.pop(req)
+                pending_trades[tid]["trade_id"] = tid
+
+    elif ev in ("closeorder", "updateorder", "successcloseorder",
+                "deals", "deal", "traderesult"):
+        if isinstance(data, list):
+            for deal in data:
+                if isinstance(deal, dict):
                     _close_deal(deal)
-    except Exception:
-        pass
+        elif isinstance(data, dict):
+            _close_deal(data)
+
+
+def _update_balance(d: dict):
+    for key in ("balance", "demoBalance", "demo_balance", "demo",
+                "liveBalance", "live_balance"):
+        if key in d and d[key] is not None:
+            state["balance"] = float(d[key])
+            log.info("💰 Balance: $%.2f", state["balance"])
+            _broadcast()
+            return
+
+
+def _parse_binary(data: bytes):
+    for skip in (0, 1, 2, 4):
+        try:
+            obj = json.loads(data[skip:].decode("utf-8", errors="replace"))
+            if isinstance(obj, dict):
+                if "balance" in obj:
+                    _update_balance(obj)
+                if ("profit" in obj or "win" in obj) and "asset" in obj:
+                    _close_deal(obj)
+                if isinstance(obj.get("requestId"), int) and "id" in obj:
+                    tid = str(obj["id"]); req = str(obj["requestId"])
+                    log.info("📋 Binary trade open id=%s", tid)
+                    if req in pending_trades:
+                        pending_trades[tid] = pending_trades.pop(req)
+            elif isinstance(obj, list):
+                for deal in obj:
+                    if isinstance(deal, dict) and "profit" in deal:
+                        _close_deal(deal)
+            return
+        except Exception:
+            continue
 
 
 def _close_deal(deal: dict):
     profit    = float(deal.get("profit", 0))
     asset     = deal.get("asset", "?")
-    direction = str(deal.get("action", "?")).upper()
+    direction = str(deal.get("action", deal.get("dir", "?"))).upper()
     tid       = str(deal.get("id", ""))
-    won       = profit > 0
+    if "win" in deal:
+        won = bool(deal["win"]) and profit >= 0
+    else:
+        won = profit > 0
 
     state["total"] += 1
     state["won"]   += 1 if won else 0
@@ -488,6 +561,36 @@ async def _trading_loop(ws):
         await asyncio.sleep(LOOP_SECS)
 
 # ══════════════════════════════════════════════════════════
+# KEEPALIVE
+# ══════════════════════════════════════════════════════════
+
+async def _keepalive(ws):
+    """Send Socket.IO ping every 20s to prevent 1005 disconnects."""
+    while state["running"] and state["connected"]:
+        await asyncio.sleep(20)
+        try:
+            await ws.send("2")
+            log.debug("↔ keepalive ping")
+        except Exception:
+            break
+
+
+async def _clean_stale_trades():
+    """Remove pending trades with no result after 3x trade duration."""
+    while state["running"]:
+        await asyncio.sleep(60)
+        cutoff = time.time() - (TRADE_DURATION * 3 + 30)
+        stale = [k for k, v in list(pending_trades.items())
+                 if v.get("opened_at", 0) < cutoff]
+        for k in stale:
+            log.warning("⏰ Stale trade %s — marking expired", k)
+            state["pending"] = max(0, state["pending"] - 1)
+            del pending_trades[k]
+        if stale:
+            _broadcast()
+
+
+# ══════════════════════════════════════════════════════════
 # BOT RUNNER
 # ══════════════════════════════════════════════════════════
 
@@ -496,7 +599,7 @@ async def _run_bot():
     try:
         ssid, cookie, ws_headers = _get_auth_params()
     except RuntimeError as e:
-        state["error"] = state["running"] = False
+        state["running"] = False
         state["error"] = str(e)
         log.error(str(e))
         _broadcast()
@@ -511,23 +614,25 @@ async def _run_bot():
                 WS_URL,
                 ssl=_ssl_ctx(),
                 extra_headers=ws_headers,
-                ping_interval=20,
-                ping_timeout=30,
+                ping_interval=None,
+                ping_timeout=None,
             ) as ws:
+                global _ws_conn
                 _ws_conn = ws
                 state["connected"] = False
 
                 handler = asyncio.create_task(_ws_handler(ws, ssid))
 
-                # Wait for auth (up to 20s)
                 for _ in range(40):
                     if state["connected"]:
                         break
                     await asyncio.sleep(0.5)
 
                 if state["connected"]:
-                    trader = asyncio.create_task(_trading_loop(ws))
-                    await asyncio.gather(handler, trader)
+                    trader  = asyncio.create_task(_trading_loop(ws))
+                    alive   = asyncio.create_task(_keepalive(ws))
+                    cleaner = asyncio.create_task(_clean_stale_trades())
+                    await asyncio.gather(handler, trader, alive, cleaner)
                 else:
                     handler.cancel()
                     log.error("Auth timeout — session may be expired")
