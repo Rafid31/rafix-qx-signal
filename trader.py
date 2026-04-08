@@ -1,20 +1,25 @@
 """
-Pocket Option Algo Trader v2.0.0
+Pocket Option Algo Trader v3.0.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Auth method (confirmed working):
-  • Cookie: ci_session + autologin sent in WebSocket Upgrade headers
-  • SSID:   42["auth",{"session":"<escaped_ci_session>","isDemo":1,"uid":<uid>,"platform":1}]
-  • Trades every 30 s using 6-indicator signal engine
-  • Web dashboard with START / STOP + live trade log
-  • DEMO mode by default — set TRADE_MODE=REAL for real money
+Architecture:
+  • Candle data  → Yahoo Finance HTTP API (instant, no wait)
+  • Trading      → Pocket Option WebSocket (auth + openOrder)
+  • First trade  → within 30-60 seconds of pressing START
+  • Signal engine → RSI + BB + Stoch + MACD + EMA + Reversal (6 indicators)
 
-Environment variables:
-  POCKET_SSID       Full 42["auth",...] message string
-  POCKET_COOKIE     Raw Cookie header: ci_session=...&autologin=...
-  POCKET_UID        Pocket Option user ID (numeric)
-  TRADE_AMOUNT      $ per trade (default 1.0)
-  TRADE_DURATION    Seconds per trade (default 30)
-  TRADE_MODE        DEMO or REAL (default DEMO)
+Auth method (confirmed working):
+  • Cookie in WebSocket Upgrade headers
+  • SSID: 42["auth",{"session":"<escaped>","isDemo":1,"uid":<uid>,"platform":1}]
+
+Environment variables (Railway):
+  POCKET_SSID     Full 42["auth",...] message string
+  POCKET_COOKIE   Raw cookie header string
+  POCKET_UID      User ID (numeric)
+  TRADE_AMOUNT    $ per trade (default 1.0)
+  TRADE_DURATION  Seconds (default 30)
+  TRADE_MODE      DEMO or REAL (default DEMO)
+  SIGNAL_THRESH   Min confidence % to trade (default 55)
+  LOOP_SECS       Seconds between scans (default 30)
 """
 
 import asyncio
@@ -25,12 +30,13 @@ import ssl
 import time
 import threading
 import urllib.parse
+import urllib.request
 from collections import deque
 from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
-import pandas as pd
+import requests
 import websockets
 from fastapi import FastAPI, WebSocket as FWebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,130 +55,151 @@ log = logging.getLogger("po_trader")
 # ══════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════
-VERSION         = "2.0.0"
-POCKET_SSID     = os.environ.get("POCKET_SSID", "")
-POCKET_COOKIE   = os.environ.get("POCKET_COOKIE", "")
-POCKET_UID      = int(os.environ.get("POCKET_UID", "0"))
-TRADE_AMOUNT    = float(os.environ.get("TRADE_AMOUNT", "1.0"))
-TRADE_DURATION  = int(os.environ.get("TRADE_DURATION", "30"))
-MIN_CANDLES     = 50
-SIGNAL_THRESH   = 60.0
-LOOP_SECS       = 30
-MAX_TRADES_HOUR = 20
-TRADE_MODE      = os.environ.get("TRADE_MODE", "DEMO")
-IS_DEMO         = (TRADE_MODE.upper() != "REAL")
+VERSION        = "3.0.0"
+POCKET_SSID    = os.environ.get("POCKET_SSID", "")
+POCKET_COOKIE  = os.environ.get("POCKET_COOKIE", "")
+POCKET_UID     = int(os.environ.get("POCKET_UID", "0"))
+TRADE_AMOUNT   = float(os.environ.get("TRADE_AMOUNT", "1.0"))
+TRADE_DURATION = int(os.environ.get("TRADE_DURATION", "30"))
+TRADE_MODE     = os.environ.get("TRADE_MODE", "DEMO")
+IS_DEMO        = (TRADE_MODE.upper() != "REAL")
+SIGNAL_THRESH  = float(os.environ.get("SIGNAL_THRESH", "55.0"))
+LOOP_SECS      = int(os.environ.get("LOOP_SECS", "30"))
+MAX_TRADES_HR  = int(os.environ.get("MAX_TRADES_HOUR", "20"))
+MIN_CANDLES    = 14   # only 14 candles needed → data loaded instantly
 
-WS_URL_DEMO     = "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
-WS_URL_REAL     = "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
-WS_URL          = WS_URL_DEMO if IS_DEMO else WS_URL_REAL
+WS_URL = (
+    "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket"
+    if IS_DEMO else
+    "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket"
+)
 
-TRADING_PAIRS = [
-    "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc",
-    "GBPJPY_otc", "EURJPY_otc", "BTCUSD_otc", "ETHUSD_otc",
-]
+# Pocket Option asset → Yahoo Finance ticker
+PAIRS = {
+    "EURUSD_otc": "EURUSD=X",
+    "GBPUSD_otc": "GBPUSD=X",
+    "USDJPY_otc": "USDJPY=X",
+    "AUDUSD_otc": "AUDUSD=X",
+    "GBPJPY_otc": "GBPJPY=X",
+    "EURJPY_otc": "EURJPY=X",
+    "EURCAD_otc": "EURCAD=X",
+    "EURGBP_otc": "EURGBP=X",
+}
 
 # ══════════════════════════════════════════════════════════
 # GLOBAL STATE
 # ══════════════════════════════════════════════════════════
 state = {
-    "running":      False,
-    "connected":    False,
-    "balance":      0.0,
-    "mode":         TRADE_MODE,
-    "total":        0,
-    "won":          0,
-    "lost":         0,
-    "pending":      0,
-    "trades_hour":  0,
-    "hour_ts":      time.time(),
-    "last_signal":  "",
-    "error":        "",
-    "version":      VERSION,
+    "running":     False,
+    "connected":   False,
+    "balance":     0.0,
+    "mode":        TRADE_MODE,
+    "total":       0,
+    "won":         0,
+    "lost":        0,
+    "pending":     0,
+    "trades_hour": 0,
+    "hour_ts":     time.time(),
+    "last_signal": "",
+    "error":       "",
+    "version":     VERSION,
+    "data_source": "Yahoo Finance",
 }
 trade_log: deque = deque(maxlen=100)
-
-# Candle store per pair — deque of {"time", "open", "close", "high", "low"}
-candles: dict = {pair: deque(maxlen=500) for pair in TRADING_PAIRS}
-
-# Pending trade IDs waiting for result
-pending_trades: dict = {}   # trade_id → {"pair", "direction", "amount", "opened_at"}
-
-# WebSocket connection (live)
-_ws_conn   = None
-_ws_lock   = asyncio.Lock()
-_ws_loop   = None
-_trader_task = None
-_stop_event  = threading.Event()
+pending_trades: dict = {}
+_ws_conn = None
+_ws_loop = None
+_dashboard_clients: list = []
 
 # ══════════════════════════════════════════════════════════
-# SSID / COOKIE HELPERS
+# YAHOO FINANCE CANDLE FETCHER
 # ══════════════════════════════════════════════════════════
 
-def _build_ssid_from_cookie(ci_session_raw: str, uid: int, is_demo: bool) -> str:
+def fetch_candles_yf(yf_ticker: str, count: int = 50) -> list:
     """
-    Build the Socket.IO auth message from a URL-encoded ci_session cookie value.
-    Escape any double-quotes in the decoded PHP serialized string.
+    Fetch 1-minute OHLC candles from Yahoo Finance.
+    Returns list of {"time","open","close","high","low"} dicts.
+    Falls back to 5-minute data on market close.
     """
-    decoded = urllib.parse.unquote(ci_session_raw)
-    escaped = decoded.replace("\\", "\\\\").replace('"', '\\"')
-    demo_flag = 1 if is_demo else 0
-    return f'42["auth",{{"session":"{escaped}","isDemo":{demo_flag},"uid":{uid},"platform":1}}]'
-
-
-def _get_auth_params():
-    """
-    Return (ssid, cookie_header, ws_headers).
-    Priority:
-      1. POCKET_SSID + POCKET_COOKIE env vars (Railway / manual)
-      2. Chrome browser cookies (local machine)
-    """
-    ssid   = POCKET_SSID
-    cookie = POCKET_COOKIE
-    uid    = POCKET_UID
-
-    # Try to read from Chrome if not set via env
-    if not ssid or not cookie:
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+    }
+    # Try 1-minute interval first (last 1 day)
+    for interval, period in [("1m", "1d"), ("5m", "5d"), ("15m", "5d")]:
         try:
-            import browser_cookie3
-            cookies = browser_cookie3.chrome(domain_name='.pocketoption.com')
-            jar = {c.name: c.value for c in cookies}
-            ci_raw = jar.get("ci_session", "")
-            if ci_raw and not uid:
-                # Extract uid from autologin cookie
-                autologin_raw = jar.get("autologin", "")
-                if autologin_raw:
-                    autologin = urllib.parse.unquote(autologin_raw)
-                    import re
-                    m = re.search(r'"user_id";s:\d+:"(\d+)"', autologin)
-                    if m:
-                        uid = int(m.group(1))
-            if ci_raw and uid:
-                ssid   = _build_ssid_from_cookie(ci_raw, uid, IS_DEMO)
-                autologin_raw = jar.get("autologin", "")
-                cookie = (
-                    f"ci_session={ci_raw}"
-                    + (f"; autologin={autologin_raw}" if autologin_raw else "")
-                    + "; loggedIn=1; lang=en"
-                )
-                log.info("Auth loaded from Chrome browser cookies (uid=%s)", uid)
+            url = (
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_ticker}"
+                f"?interval={interval}&range={period}"
+            )
+            resp = requests.get(url, headers=headers, timeout=8)
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            result = data.get("chart", {}).get("result", [])
+            if not result:
+                continue
+            r = result[0]
+            timestamps = r.get("timestamp", [])
+            quote = r.get("indicators", {}).get("quote", [{}])[0]
+            opens  = quote.get("open",  [])
+            closes = quote.get("close", [])
+            highs  = quote.get("high",  [])
+            lows   = quote.get("low",   [])
+
+            candles = []
+            for i in range(len(timestamps)):
+                try:
+                    if (opens[i] is not None and closes[i] is not None and
+                            highs[i] is not None and lows[i] is not None):
+                        candles.append({
+                            "time":  timestamps[i],
+                            "open":  float(opens[i]),
+                            "close": float(closes[i]),
+                            "high":  float(highs[i]),
+                            "low":   float(lows[i]),
+                        })
+                except (IndexError, TypeError):
+                    pass
+
+            if len(candles) >= MIN_CANDLES:
+                log.debug("YF %s: %d candles (%s)", yf_ticker, len(candles), interval)
+                return candles[-count:]  # return last N candles
         except Exception as e:
-            log.warning("Could not load Chrome cookies: %s", e)
+            log.debug("YF fetch error %s %s: %s", yf_ticker, interval, e)
+            continue
 
-    if not ssid:
-        raise RuntimeError(
-            "No SSID available. Set POCKET_SSID + POCKET_COOKIE env vars, "
-            "or run locally with Pocket Option open in Chrome."
-        )
+    return []
 
-    ws_headers = {"Origin": "https://pocketoption.com"}
-    if cookie:
-        ws_headers["Cookie"] = cookie
 
-    return ssid, cookie, ws_headers
+# Cache candles to avoid hammering Yahoo Finance
+_candle_cache: dict = {}   # yf_ticker → (timestamp, candles)
+_CACHE_TTL = 25  # seconds — refresh just before each trading loop
+
+
+def get_candles(po_pair: str) -> list:
+    """Get candles for a PO pair (with caching)."""
+    yf_ticker = PAIRS.get(po_pair)
+    if not yf_ticker:
+        return []
+    now = time.time()
+    cached = _candle_cache.get(yf_ticker)
+    if cached and (now - cached[0]) < _CACHE_TTL:
+        return cached[1]
+    candles = fetch_candles_yf(yf_ticker)
+    _candle_cache[yf_ticker] = (now, candles)
+    return candles
 
 # ══════════════════════════════════════════════════════════
-# SIGNAL ENGINE  (same as QX server.py v2.6.2)
+# SIGNAL ENGINE
 # ══════════════════════════════════════════════════════════
+
+def _ema(arr: np.ndarray, n: int) -> float:
+    s = arr[0]; k = 2 / (n + 1)
+    for v in arr[1:]:
+        s = v * k + s * (1 - k)
+    return s
+
 
 def compute_rsi(prices: np.ndarray, period: int = 7) -> float:
     if len(prices) < period + 1:
@@ -180,261 +207,231 @@ def compute_rsi(prices: np.ndarray, period: int = 7) -> float:
     deltas = np.diff(prices[-(period + 1):])
     gains  = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = gains.mean()
-    avg_loss = losses.mean()
-    if avg_loss == 0:
+    ag, al = gains.mean(), losses.mean()
+    if al == 0:
         return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - 100 / (1 + rs)
+    return 100 - 100 / (1 + ag / al)
 
 
-def generate_signal(pair: str) -> dict:
-    """Run signal engine on candle history. Returns signal dict."""
-    cdls = list(candles[pair])
+def generate_signal(po_pair: str) -> dict:
+    cdls = get_candles(po_pair)
     if len(cdls) < MIN_CANDLES:
-        return {"signal": "WAIT", "confidence": 0, "reason": "Not enough candles"}
+        return {"signal": "WAIT", "confidence": 0,
+                "reason": f"Only {len(cdls)} candles (need {MIN_CANDLES})"}
 
     closes = np.array([c["close"] for c in cdls], dtype=float)
     highs  = np.array([c["high"]  for c in cdls], dtype=float)
     lows   = np.array([c["low"]   for c in cdls], dtype=float)
+    buy = sell = 0.0
 
-    score_buy = score_sell = 0.0
-
-    # --- RSI(7) weight 2.5 ---
+    # RSI(7) — weight 2.5
     rsi = compute_rsi(closes, 7)
     if not np.isnan(rsi):
-        if rsi < 30:   score_buy  += 2.5
-        elif rsi > 70: score_sell += 2.5
+        if rsi < 30:   buy  += 2.5
+        elif rsi > 70: sell += 2.5
         else:
-            score_buy  += 2.5 * max(0, (50 - rsi) / 20)
-            score_sell += 2.5 * max(0, (rsi - 50) / 20)
+            buy  += 2.5 * max(0, (50 - rsi) / 20)
+            sell += 2.5 * max(0, (rsi - 50) / 20)
 
-    # --- Bollinger Bands(14) weight 2.5 ---
+    # Bollinger Bands(14) — weight 2.5
     if len(closes) >= 14:
-        bb_mid = closes[-14:].mean()
-        bb_std = closes[-14:].std()
-        bb_up  = bb_mid + 2 * bb_std
-        bb_dn  = bb_mid - 2 * bb_std
-        price  = closes[-1]
-        if bb_std > 0:
-            pct = (price - bb_dn) / (bb_up - bb_dn)
-            if pct < 0.2:  score_buy  += 2.5
-            elif pct > 0.8: score_sell += 2.5
+        bb_m = closes[-14:].mean()
+        bb_s = closes[-14:].std()
+        if bb_s > 0:
+            pct = (closes[-1] - (bb_m - 2*bb_s)) / (4*bb_s)
+            if pct < 0.2:   buy  += 2.5
+            elif pct > 0.8: sell += 2.5
 
-    # --- Stochastic(5,3) weight 2.0 ---
-    if len(closes) >= 8:
+    # Stochastic(5) — weight 2.0
+    if len(closes) >= 5:
         h5 = highs[-5:].max(); l5 = lows[-5:].min()
         if h5 != l5:
             k = (closes[-1] - l5) / (h5 - l5) * 100
-            if k < 20:   score_buy  += 2.0
-            elif k > 80: score_sell += 2.0
+            if k < 20:   buy  += 2.0
+            elif k > 80: sell += 2.0
 
-    # --- MACD(5,13,4) weight 3.0 ---
+    # MACD(5,13) — weight 3.0
     if len(closes) >= 13:
-        def ema(arr, n):
-            s = arr[0]; k = 2/(n+1)
-            for v in arr[1:]: s = v*k + s*(1-k)
-            return s
-        fast = ema(closes[-13:], 5)
-        slow = ema(closes[-13:], 13)
-        macd_line = fast - slow
-        if macd_line > 0:   score_buy  += 3.0
-        elif macd_line < 0: score_sell += 3.0
+        macd = _ema(closes[-13:], 5) - _ema(closes[-13:], 13)
+        if macd > 0:   buy  += 3.0
+        elif macd < 0: sell += 3.0
 
-    # --- EMA(3) vs EMA(8) weight 2.5 ---
+    # EMA(3) vs EMA(8) — weight 2.5
     if len(closes) >= 8:
-        def ema(arr, n):
-            s = arr[0]; k = 2/(n+1)
-            for v in arr[1:]: s = v*k + s*(1-k)
-            return s
-        ema3 = ema(closes[-8:], 3)
-        ema8 = ema(closes[-8:], 8)
-        if ema3 > ema8:   score_buy  += 2.5
-        elif ema3 < ema8: score_sell += 2.5
+        if _ema(closes[-8:], 3) > _ema(closes[-8:], 8): buy  += 2.5
+        else:                                             sell += 2.5
 
-    # --- Reversal weight 2.0 ---
-    if len(closes) >= 5:
-        recent  = closes[-3:].mean()
-        earlier = closes[-6:-3].mean() if len(closes) >= 6 else closes[-3:].mean()
-        if recent < earlier: score_buy  += 2.0
-        elif recent > earlier: score_sell += 2.0
+    # Reversal — weight 2.0
+    if len(closes) >= 6:
+        rec = closes[-3:].mean(); ear = closes[-6:-3].mean()
+        if rec < ear:   buy  += 2.0
+        elif rec > ear: sell += 2.0
 
-    total_weight = 14.5
-    confidence_buy  = score_buy  / total_weight * 100
-    confidence_sell = score_sell / total_weight * 100
+    W = 14.5
+    cb = round(buy  / W * 100, 1)
+    cs = round(sell / W * 100, 1)
 
-    if confidence_buy > confidence_sell and confidence_buy >= SIGNAL_THRESH:
-        return {"signal": "BUY",  "confidence": round(confidence_buy, 1)}
-    elif confidence_sell > confidence_buy and confidence_sell >= SIGNAL_THRESH:
-        return {"signal": "SELL", "confidence": round(confidence_sell, 1)}
-    return {"signal": "WAIT", "confidence": round(max(confidence_buy, confidence_sell), 1)}
+    if cb >= cs and cb >= SIGNAL_THRESH:
+        return {"signal": "BUY",  "confidence": cb, "candles": len(cdls)}
+    if cs > cb and cs >= SIGNAL_THRESH:
+        return {"signal": "SELL", "confidence": cs, "candles": len(cdls)}
+    return {"signal": "WAIT", "confidence": max(cb, cs), "candles": len(cdls)}
 
 # ══════════════════════════════════════════════════════════
-# POCKET OPTION WebSocket CLIENT
+# AUTH HELPERS
 # ══════════════════════════════════════════════════════════
+
+def _get_auth_params():
+    ssid   = POCKET_SSID
+    cookie = POCKET_COOKIE
+    uid    = POCKET_UID
+
+    if not ssid or not cookie:
+        try:
+            import browser_cookie3, re
+            jar = {c.name: c.value for c in
+                   browser_cookie3.chrome(domain_name='.pocketoption.com')}
+            ci_raw = jar.get("ci_session", "")
+            if ci_raw:
+                if not uid:
+                    al = urllib.parse.unquote(jar.get("autologin", ""))
+                    m  = re.search(r'"user_id";s:\d+:"(\d+)"', al)
+                    uid = int(m.group(1)) if m else 0
+                if uid:
+                    ci  = urllib.parse.unquote(ci_raw)
+                    esc = ci.replace("\\", "\\\\").replace('"', '\\"')
+                    d   = 1 if IS_DEMO else 0
+                    ssid   = f'42["auth",{{"session":"{esc}","isDemo":{d},"uid":{uid},"platform":1}}]'
+                    autologin_raw = jar.get("autologin", "")
+                    cookie = (f"ci_session={ci_raw}"
+                              + (f"; autologin={autologin_raw}" if autologin_raw else "")
+                              + "; loggedIn=1; lang=en")
+                    log.info("Auth loaded from Chrome (uid=%s)", uid)
+        except Exception as e:
+            log.warning("Chrome cookie load failed: %s", e)
+
+    if not ssid:
+        raise RuntimeError(
+            "No auth. Set POCKET_SSID + POCKET_COOKIE env vars, "
+            "or run locally with Pocket Option open in Chrome."
+        )
+    ws_headers = {"Origin": "https://pocketoption.com"}
+    if cookie:
+        ws_headers["Cookie"] = cookie
+    return ssid, cookie, ws_headers
+
 
 def _ssl_ctx():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    ctx.verify_mode    = ssl.CERT_NONE
     return ctx
 
+# ══════════════════════════════════════════════════════════
+# POCKET OPTION WebSocket HANDLER
+# ══════════════════════════════════════════════════════════
 
-async def _ws_listener(ws, ssid: str):
-    """
-    Handle all incoming messages from Pocket Option WebSocket.
-    Protocol:
-      Server: 0{sid}   → Client: 40
-      Server: 40{sid}  → Client: SSID (auth message)
-      Server: 451-["updateAssets"] → auth confirmed
-      Binary data      → balance / order results / candle data
-    """
-    global _ws_conn
+async def _ws_handler(ws, ssid: str):
+    """Handle all incoming WS messages."""
     sent_auth = False
-    auth_confirmed = False
 
     async for msg in ws:
         try:
             if isinstance(msg, bytes):
-                await _handle_binary(msg)
-            else:
-                await _handle_text(ws, msg, ssid, sent_auth, auth_confirmed)
-                # Update flags based on response
-                if msg.startswith("40{") and "sid" in msg and not sent_auth:
-                    sent_auth = True
-                elif "updateAssets" in msg and not auth_confirmed:
-                    auth_confirmed = True
-                    state["connected"] = True
-                    log.info("✅ Authenticated with Pocket Option!")
-                    _broadcast_state()
-                    # Request balance
-                    await ws.send('42["sendMessage",{"name":"get-balances","version":"1.0"}]')
+                _parse_binary(msg)
+            elif msg.startswith("0{") and "sid" in msg:
+                await ws.send("40")
+            elif msg == "2":
+                await ws.send("3")
+            elif msg.startswith("40{") and "sid" in msg and not sent_auth:
+                sent_auth = True
+                await ws.send(ssid)
+                log.info("SSID auth sent")
+            elif "updateAssets" in msg and not state["connected"]:
+                state["connected"] = True
+                log.info("✅ PO connected!")
+                await ws.send('42["sendMessage",{"name":"get-balances","version":"1.0"}]')
+                _broadcast()
+            elif "NotAuthorized" in msg:
+                log.error("❌ Not authorized — session expired")
+                state["error"]     = "Session expired. Update POCKET_SSID + POCKET_COOKIE."
+                state["connected"] = False
+                _broadcast()
         except Exception as e:
-            log.error("WS message error: %s", e)
+            log.error("WS msg error: %s", e)
 
 
-async def _handle_text(ws, msg: str, ssid: str, sent_auth: bool, auth_confirmed: bool):
-    """Process text Socket.IO frames."""
-    if msg.startswith("0{") and "sid" in msg:
-        await ws.send("40")
-        log.debug("SND: 40 (namespace connect)")
-
-    elif msg.startswith("40{") and "sid" in msg and not sent_auth:
-        await ws.send(ssid)
-        log.info("SND: SSID auth message")
-
-    elif msg == "2":
-        await ws.send("3")  # pong
-
-    elif "updateAssets" in msg:
-        log.debug("updateAssets received → auth confirmed")
-
-    elif "successopenOrder" in msg:
-        log.info("Trade opened successfully")
-
-    elif "updateBalance" in msg:
-        log.debug("Balance update event: %s", msg[:200])
-
-    elif "NotAuthorized" in msg:
-        log.error("❌ Not authorized — SSID/session expired. Update POCKET_SSID.")
-        state["error"]     = "Session expired. Please update POCKET_SSID."
-        state["connected"] = False
-
-    elif "updateClosedDeals" in msg:
-        log.debug("Closed deals update")
-
-
-async def _handle_binary(data: bytes):
-    """Process binary msgpack/JSON frames (balance, orders, candles)."""
+def _parse_binary(data: bytes):
     try:
-        raw = data.decode("utf-8", errors="replace")
-        obj = json.loads(raw)
-
+        obj = json.loads(data.decode("utf-8", errors="replace"))
         if isinstance(obj, dict):
-            # Balance update
             if "balance" in obj and "uid" in obj:
-                balance = float(obj["balance"])
-                is_demo  = bool(obj.get("isDemo", 1))
-                state["balance"] = balance
-                log.info("💰 Balance: $%.2f (isDemo=%s)", balance, is_demo)
-                _broadcast_state()
-
-            # Trade open confirmation
-            if obj.get("requestId") == "buy" or "requestId" in obj:
-                trade_id  = obj.get("id") or obj.get("requestId")
-                asset     = obj.get("asset", "?")
-                direction = obj.get("action", obj.get("direction", "?"))
-                amount    = obj.get("amount", 0)
-                log.info("📋 Trade opened: %s %s %s $%.2f id=%s",
-                         asset, direction, TRADE_DURATION, amount, trade_id)
-                if trade_id in pending_trades:
-                    pending_trades[trade_id]["opened"] = True
-
+                state["balance"] = float(obj["balance"])
+                log.info("💰 Balance: $%.2f", state["balance"])
+                _broadcast()
+            # trade open confirmation
+            if obj.get("requestId") == "buy" or (
+                    isinstance(obj.get("requestId"), int) and "id" in obj):
+                tid = str(obj.get("id", obj.get("requestId", "")))
+                log.info("📋 Trade opened id=%s", tid)
+                if tid in pending_trades:
+                    pending_trades[tid]["opened"] = True
         elif isinstance(obj, list):
-            # Closed deals / trade results
             for deal in obj:
                 if isinstance(deal, dict) and "profit" in deal:
-                    _process_closed_deal(deal)
+                    _close_deal(deal)
+    except Exception:
+        pass
 
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        pass  # Binary format not parseable as JSON (msgpack, etc.)
 
-
-def _process_closed_deal(deal: dict):
-    """Handle a closed trade deal."""
-    trade_id  = deal.get("id")
+def _close_deal(deal: dict):
     profit    = float(deal.get("profit", 0))
     asset     = deal.get("asset", "?")
-    direction = deal.get("action", "?")
+    direction = str(deal.get("action", "?")).upper()
+    tid       = str(deal.get("id", ""))
+    won       = profit > 0
 
-    won = profit > 0
-    state["total"]   += 1
-    state["won"]     += 1 if won else 0
-    state["lost"]    += 0 if won else 1
+    state["total"] += 1
+    state["won"]   += 1 if won else 0
+    state["lost"]  += 0 if won else 1
     state["pending"] = max(0, state["pending"] - 1)
 
-    result = "WIN" if won else "LOSS"
     entry = {
         "time":      datetime.now(timezone.utc).strftime("%H:%M:%S"),
         "pair":      asset,
-        "direction": direction.upper(),
+        "direction": direction,
         "amount":    deal.get("amount", TRADE_AMOUNT),
         "profit":    profit,
-        "result":    result,
+        "result":    "WIN" if won else "LOSS",
     }
     trade_log.appendleft(entry)
-    log.info("🏁 Trade %s: %s %s → %s profit=%.2f",
-             trade_id, asset, direction.upper(), result, profit)
-    _broadcast_state()
-    if trade_id in pending_trades:
-        del pending_trades[trade_id]
+    log.info("🏁 %s %s %s → %s  profit=%.4f",
+             asset, direction, tid, entry["result"], profit)
+    if tid in pending_trades:
+        del pending_trades[tid]
+    _broadcast()
 
 
-async def _place_trade(ws, pair: str, direction: str) -> Optional[str]:
-    """Place a real trade via WebSocket."""
-    is_demo   = 1 if IS_DEMO else 0
-    req_id    = int(time.time() * 1000) % 2147483647
+async def _place_trade(ws, pair: str, direction: str) -> str:
+    is_demo = 1 if IS_DEMO else 0
+    req_id  = int(time.time() * 1000) % 2_147_483_647
     msg = (
-        f'42["openOrder",{{'
-        f'"asset":"{pair}",'
+        f'42["openOrder",{{"asset":"{pair}",'
         f'"amount":{TRADE_AMOUNT},'
         f'"action":"{direction.lower()}",'
         f'"isDemo":{is_demo},'
         f'"requestId":{req_id},'
         f'"optionType":100,'
-        f'"time":{TRADE_DURATION}'
-        f'}}]'
+        f'"time":{TRADE_DURATION}}}]'
     )
     await ws.send(msg)
     pending_trades[str(req_id)] = {
-        "pair":       pair,
-        "direction":  direction,
-        "amount":     TRADE_AMOUNT,
-        "opened_at":  time.time(),
+        "pair": pair, "direction": direction,
+        "amount": TRADE_AMOUNT, "opened_at": time.time(),
     }
-    state["pending"] += 1
-    state["total"]   += 1  # tentative (corrected on close)
-    log.info("🚀 Trade: %s %s $%.2f %ds (reqId=%d)",
+    state["pending"]     += 1
+    state["trades_hour"] += 1
+    log.info("🚀 %s %s $%.2f %ds (reqId=%d)",
              pair, direction.upper(), TRADE_AMOUNT, TRADE_DURATION, req_id)
     return str(req_id)
 
@@ -442,20 +439,19 @@ async def _place_trade(ws, pair: str, direction: str) -> Optional[str]:
 # TRADING LOOP
 # ══════════════════════════════════════════════════════════
 
-async def _subscribe_candles(ws, pair: str):
-    """Subscribe to real-time candle stream for a pair."""
-    msg = json.dumps(["changeSymbol", {"asset": pair, "period": TRADE_DURATION}])
-    await ws.send(f"42{msg}")
-
-
 async def _trading_loop(ws):
-    """Main trading logic — runs every LOOP_SECS seconds."""
-    # Subscribe to all pairs
-    for pair in TRADING_PAIRS:
-        await _subscribe_candles(ws, pair)
-        await asyncio.sleep(0.1)
+    """Scan pairs every LOOP_SECS seconds and fire trades on strong signals."""
+    log.info("Trading loop started — scanning %d pairs every %ds",
+             len(PAIRS), LOOP_SECS)
 
-    log.info("Subscribed to %d pairs. Trading loop started.", len(TRADING_PAIRS))
+    # Pre-warm candle cache in background
+    def warm():
+        for pair in PAIRS:
+            get_candles(pair)
+    threading.Thread(target=warm, daemon=True).start()
+
+    # First scan after 10 seconds (give cache time to warm)
+    await asyncio.sleep(10)
 
     while state["running"] and state["connected"]:
         # Hour rate-limit reset
@@ -463,55 +459,51 @@ async def _trading_loop(ws):
             state["trades_hour"] = 0
             state["hour_ts"]     = time.time()
 
-        if state["trades_hour"] >= MAX_TRADES_HOUR:
-            log.warning("Max trades/hour reached (%d). Pausing.", MAX_TRADES_HOUR)
+        if state["trades_hour"] >= MAX_TRADES_HR:
+            log.warning("Max trades/hour (%d) reached — pausing", MAX_TRADES_HR)
             await asyncio.sleep(LOOP_SECS)
             continue
 
-        # Scan all pairs for a signal
-        best_pair       = None
-        best_direction  = None
-        best_confidence = 0.0
+        best_pair = best_dir = None
+        best_conf = 0.0
 
-        for pair in TRADING_PAIRS:
+        for pair in PAIRS:
             sig = generate_signal(pair)
-            if sig["signal"] in ("BUY", "SELL") and sig["confidence"] > best_confidence:
-                best_pair       = pair
-                best_direction  = "call" if sig["signal"] == "BUY" else "put"
-                best_confidence = sig["confidence"]
+            log.debug("Signal %s: %s %.1f%% (%d cdls)",
+                      pair, sig["signal"], sig["confidence"], sig.get("candles", 0))
+            if sig["signal"] in ("BUY", "SELL") and sig["confidence"] > best_conf:
+                best_pair = pair
+                best_dir  = "call" if sig["signal"] == "BUY" else "put"
+                best_conf = sig["confidence"]
 
         if best_pair:
             state["last_signal"] = (
-                f"{best_pair} {best_direction.upper()} "
-                f"{best_confidence:.0f}%"
+                f"{best_pair} {best_dir.upper()} {best_conf:.0f}%"
             )
-            log.info("Signal: %s", state["last_signal"])
-            await _place_trade(ws, best_pair, best_direction)
-            state["trades_hour"] += 1
+            await _place_trade(ws, best_pair, best_dir)
         else:
-            state["last_signal"] = "WAIT — no strong signal"
+            state["last_signal"] = "WAIT — no signal above threshold"
 
-        _broadcast_state()
+        _broadcast()
         await asyncio.sleep(LOOP_SECS)
 
+# ══════════════════════════════════════════════════════════
+# BOT RUNNER
+# ══════════════════════════════════════════════════════════
 
 async def _run_bot():
-    """Connect to Pocket Option and run bot until stopped."""
-    global _ws_conn
     state["error"] = ""
-
     try:
         ssid, cookie, ws_headers = _get_auth_params()
     except RuntimeError as e:
-        state["error"]   = str(e)
-        state["running"] = False
+        state["error"] = state["running"] = False
+        state["error"] = str(e)
         log.error(str(e))
-        _broadcast_state()
+        _broadcast()
         return
 
-    log.info("Connecting to %s", WS_URL)
-    log.info("Mode: %s | Amount: $%.2f | Duration: %ds",
-             TRADE_MODE, TRADE_AMOUNT, TRADE_DURATION)
+    log.info("PO Trader v%s | Mode=%s | Amount=$%.2f | Duration=%ds",
+             VERSION, TRADE_MODE, TRADE_AMOUNT, TRADE_DURATION)
 
     while state["running"]:
         try:
@@ -525,52 +517,52 @@ async def _run_bot():
                 _ws_conn = ws
                 state["connected"] = False
 
-                # Listener + trading tasks run concurrently
-                listener = asyncio.create_task(_ws_listener(ws, ssid))
+                handler = asyncio.create_task(_ws_handler(ws, ssid))
 
-                # Wait for auth confirmation before starting trading
-                for _ in range(60):  # up to 30s
+                # Wait for auth (up to 20s)
+                for _ in range(40):
                     if state["connected"]:
                         break
                     await asyncio.sleep(0.5)
 
                 if state["connected"]:
                     trader = asyncio.create_task(_trading_loop(ws))
-                    await asyncio.gather(listener, trader)
+                    await asyncio.gather(handler, trader)
                 else:
-                    listener.cancel()
-                    log.error("Auth timed out — session may be expired")
-                    state["error"] = "Auth timeout — update POCKET_SSID"
+                    handler.cancel()
+                    log.error("Auth timeout — session may be expired")
+                    state["error"]   = "Auth timeout. Update POCKET_SSID."
                     state["running"] = False
                     break
 
         except Exception as e:
-            log.error("WebSocket error: %s", e)
+            log.error("WS error: %s", e)
             state["connected"] = False
             if state["running"]:
                 log.info("Reconnecting in 5s…")
                 await asyncio.sleep(5)
 
-    state["connected"] = False
-    state["running"]   = False
-    _ws_conn = None
+    state["connected"] = state["running"] = False
     log.info("Bot stopped.")
-    _broadcast_state()
+    _broadcast()
+
+
+def _start_bot_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_run_bot())
+    loop.close()
 
 # ══════════════════════════════════════════════════════════
-# WEBSOCKET BROADCAST (dashboard ↔ server)
+# BROADCAST
 # ══════════════════════════════════════════════════════════
-_dashboard_clients: list = []
 
-
-def _broadcast_state():
+def _broadcast():
     payload = json.dumps({
         **state,
         "trades":  list(trade_log)[:20],
-        "winrate": (
-            round(state["won"] / state["total"] * 100, 1)
-            if state["total"] else 0
-        ),
+        "winrate": round(state["won"] / state["total"] * 100, 1)
+                   if state["total"] else 0,
     })
     for q in list(_dashboard_clients):
         try:
@@ -579,33 +571,22 @@ def _broadcast_state():
             pass
 
 # ══════════════════════════════════════════════════════════
-# FASTAPI APP
+# FASTAPI
 # ══════════════════════════════════════════════════════════
 app = FastAPI(title="PO Trader", version=VERSION)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-def _start_bot_thread():
-    """Start async bot in a new event loop in a background thread."""
-    global _ws_loop
-    _ws_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_ws_loop)
-    _ws_loop.run_until_complete(_run_bot())
-    _ws_loop.close()
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 
 
 @app.post("/api/start")
 async def api_start():
     if state["running"]:
         return {"ok": False, "msg": "Already running"}
-    state["running"] = True
-    t = threading.Thread(target=_start_bot_thread, daemon=True)
-    t.start()
+    state.update(running=True, total=0, won=0, lost=0,
+                 pending=0, trades_hour=0, hour_ts=time.time(),
+                 last_signal="", error="")
+    trade_log.clear()
+    threading.Thread(target=_start_bot_thread, daemon=True).start()
     return {"ok": True, "msg": "Bot started"}
 
 
@@ -613,270 +594,175 @@ async def api_start():
 async def api_stop():
     if not state["running"]:
         return {"ok": False, "msg": "Not running"}
-    state["running"]   = False
-    state["connected"] = False
-    return {"ok": True, "msg": "Stop signal sent"}
+    state["running"] = state["connected"] = False
+    return {"ok": True, "msg": "Stopped"}
 
 
 @app.get("/api/status")
 async def api_status():
-    return {
-        **state,
-        "trades":  list(trade_log)[:20],
-        "winrate": (
-            round(state["won"] / state["total"] * 100, 1)
-            if state["total"] else 0
-        ),
-    }
+    return {**state, "trades": list(trade_log)[:20],
+            "winrate": round(state["won"]/state["total"]*100,1) if state["total"] else 0}
 
 
 @app.websocket("/ws")
-async def ws_endpoint(websocket: FWebSocket):
-    await websocket.accept()
-    import asyncio
+async def ws_endpoint(ws: FWebSocket):
+    await ws.accept()
     q: asyncio.Queue = asyncio.Queue()
     _dashboard_clients.append(q)
     try:
-        # Send current state immediately
-        await websocket.send_text(json.dumps({
-            **state,
-            "trades":  list(trade_log)[:20],
-            "winrate": (
-                round(state["won"] / state["total"] * 100, 1)
-                if state["total"] else 0
-            ),
-        }))
+        await ws.send_text(json.dumps({
+            **state, "trades": list(trade_log)[:20],
+            "winrate": round(state["won"]/state["total"]*100,1) if state["total"] else 0}))
         while True:
             try:
-                msg = await asyncio.wait_for(q.get(), timeout=30)
-                await websocket.send_text(msg)
+                msg = await asyncio.wait_for(q.get(), timeout=25)
+                await ws.send_text(msg)
             except asyncio.TimeoutError:
-                await websocket.send_text('{"ping":1}')
+                await ws.send_text('{"ping":1}')
     except WebSocketDisconnect:
         pass
     finally:
-        _dashboard_clients.remove(q)
+        if q in _dashboard_clients:
+            _dashboard_clients.remove(q)
 
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    html = """<!DOCTYPE html>
+    return HTMLResponse("""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>PO Algo Trader v""" + VERSION + """</title>
 <style>
-  *{box-sizing:border-box;margin:0;padding:0}
-  body{font-family:'Segoe UI',Arial,sans-serif;background:#0a0e1a;color:#e0e6f0;min-height:100vh}
-  .header{background:linear-gradient(135deg,#1a237e,#0d47a1);padding:18px 24px;display:flex;
-    align-items:center;justify-content:space-between;box-shadow:0 2px 12px #0005}
-  .logo{font-size:1.4em;font-weight:700;letter-spacing:1px}
-  .logo span{color:#4fc3f7}
-  .badge{padding:4px 12px;border-radius:20px;font-size:.75em;font-weight:600;text-transform:uppercase}
-  .badge.demo{background:#ff9800;color:#000}
-  .badge.real{background:#f44336;color:#fff}
-  .main{max-width:1100px;margin:0 auto;padding:24px 16px}
-  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:14px;margin-bottom:20px}
-  .card{background:#151c2e;border-radius:12px;padding:16px 18px;border:1px solid #1e2a45}
-  .card .label{font-size:.72em;color:#7986a8;text-transform:uppercase;letter-spacing:.6px}
-  .card .value{font-size:1.6em;font-weight:700;margin-top:4px}
-  .card .value.green{color:#4caf50}
-  .card .value.red{color:#ef5350}
-  .card .value.blue{color:#4fc3f7}
-  .card .value.yellow{color:#ffb300}
-  .controls{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap}
-  .btn{padding:12px 28px;border:none;border-radius:8px;font-size:1em;font-weight:600;cursor:pointer;
-    transition:all .2s;letter-spacing:.4px}
-  .btn-start{background:linear-gradient(135deg,#43a047,#2e7d32);color:#fff}
-  .btn-start:hover{transform:translateY(-1px);box-shadow:0 4px 16px #4caf5040}
-  .btn-stop{background:linear-gradient(135deg,#e53935,#b71c1c);color:#fff}
-  .btn-stop:hover{transform:translateY(-1px);box-shadow:0 4px 16px #ef535040}
-  .btn:disabled{opacity:.5;cursor:not-allowed;transform:none !important}
-  .status-bar{padding:10px 16px;border-radius:8px;margin-bottom:20px;font-size:.88em;
-    display:flex;align-items:center;gap:10px}
-  .status-bar.connected{background:#1b3a1b;border:1px solid #2e7d32;color:#81c784}
-  .status-bar.disconnected{background:#2a1515;border:1px solid #7f0000;color:#ef9a9a}
-  .status-bar.running{background:#1a2a3a;border:1px solid #0288d1;color:#81d4fa}
-  .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
-  .dot.green{background:#4caf50;box-shadow:0 0 6px #4caf50}
-  .dot.red{background:#ef5350;box-shadow:0 0 6px #ef5350}
-  .dot.blue{background:#4fc3f7;animation:pulse 1.2s ease-in-out infinite;box-shadow:0 0 6px #4fc3f7}
-  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-  .table-wrap{background:#151c2e;border-radius:12px;border:1px solid #1e2a45;overflow:hidden}
-  .table-wrap h3{padding:14px 18px;font-size:.95em;color:#7986a8;border-bottom:1px solid #1e2a45}
-  table{width:100%;border-collapse:collapse;font-size:.85em}
-  th{padding:10px 14px;text-align:left;color:#546e7a;font-weight:600;text-transform:uppercase;
-    font-size:.75em;letter-spacing:.5px;background:#111827}
-  td{padding:10px 14px;border-bottom:1px solid #1a2236}
-  tr:last-child td{border-bottom:none}
-  .win{color:#4caf50;font-weight:700}
-  .loss{color:#ef5350;font-weight:700}
-  .signal{padding:10px 14px;background:#0d1526;border-radius:8px;font-size:.9em;color:#90caf9;
-    margin-bottom:20px;border:1px solid #1e2a45}
-  .error-msg{padding:10px 14px;background:#2a1515;border-radius:8px;color:#ef9a9a;
-    margin-bottom:20px;border:1px solid #7f0000;font-size:.88em;display:none}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',Arial,sans-serif;background:#060c1a;color:#dde4f0;min-height:100vh}
+.hdr{background:linear-gradient(135deg,#0d1b4b,#0a3a7a);padding:16px 22px;display:flex;align-items:center;
+  justify-content:space-between;box-shadow:0 2px 14px #0006}
+.logo{font-size:1.35em;font-weight:800;letter-spacing:1px}.logo span{color:#38bdf8}
+.badge{padding:3px 11px;border-radius:20px;font-size:.72em;font-weight:700;text-transform:uppercase}
+.badge.demo{background:#f97316;color:#000}.badge.real{background:#ef4444;color:#fff}
+.main{max-width:1060px;margin:0 auto;padding:20px 14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+.card{background:#0f1829;border:1px solid #1c2d4a;border-radius:10px;padding:14px 16px}
+.card .lbl{font-size:.7em;color:#6b7fa8;text-transform:uppercase;letter-spacing:.5px}
+.card .val{font-size:1.55em;font-weight:700;margin-top:3px}
+.val.g{color:#22c55e}.val.r{color:#ef4444}.val.b{color:#38bdf8}.val.y{color:#fbbf24}
+.bar{padding:9px 14px;border-radius:8px;margin-bottom:16px;display:flex;align-items:center;gap:9px;font-size:.86em}
+.bar.ok{background:#0d2710;border:1px solid #166534;color:#86efac}
+.bar.ng{background:#2a0c0c;border:1px solid #7f1d1d;color:#fca5a5}
+.bar.cn{background:#0c1f35;border:1px solid #075985;color:#7dd3fc}
+.dot{width:8px;height:8px;border-radius:50%}
+.dot.g{background:#22c55e;box-shadow:0 0 5px #22c55e}
+.dot.r{background:#ef4444;box-shadow:0 0 5px #ef4444}
+.dot.b{background:#38bdf8;animation:pulse 1.1s ease-in-out infinite;box-shadow:0 0 5px #38bdf8}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.sig{padding:9px 14px;background:#0b1526;border-radius:7px;border:1px solid #1c2d4a;
+  color:#7dd3fc;font-size:.88em;margin-bottom:16px}
+.ctrls{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}
+.btn{padding:11px 26px;border:none;border-radius:7px;font-size:.95em;font-weight:700;cursor:pointer;transition:all .18s}
+.btn-s{background:linear-gradient(135deg,#16a34a,#14532d);color:#fff}
+.btn-s:hover{transform:translateY(-1px);box-shadow:0 4px 15px #22c55e40}
+.btn-x{background:linear-gradient(135deg,#dc2626,#7f1d1d);color:#fff}
+.btn-x:hover{transform:translateY(-1px);box-shadow:0 4px 15px #ef444440}
+.btn:disabled{opacity:.45;cursor:not-allowed;transform:none!important}
+.err{padding:9px 14px;background:#2a0c0c;border:1px solid #7f1d1d;border-radius:7px;
+  color:#fca5a5;font-size:.84em;margin-bottom:16px;display:none}
+.tbl-wrap{background:#0f1829;border:1px solid #1c2d4a;border-radius:10px;overflow:hidden}
+.tbl-wrap h3{padding:12px 16px;font-size:.88em;color:#6b7fa8;border-bottom:1px solid #1c2d4a}
+table{width:100%;border-collapse:collapse;font-size:.83em}
+th{padding:9px 13px;text-align:left;color:#475569;font-weight:600;text-transform:uppercase;font-size:.72em;background:#0b1220}
+td{padding:9px 13px;border-bottom:1px solid #141f32}
+tr:last-child td{border-bottom:none}
+.win{color:#22c55e;font-weight:700}.loss{color:#ef4444;font-weight:700}
+.ds{font-size:.75em;color:#475569;margin-left:8px}
 </style>
 </head>
 <body>
-<div class="header">
-  <div class="logo">🤖 PO Algo <span>Trader</span></div>
-  <span id="mode-badge" class="badge demo">""" + TRADE_MODE + """</span>
+<div class="hdr">
+  <div class="logo">🤖 PO Algo <span>Trader</span> <span class="ds">v""" + VERSION + """ · Yahoo Finance data</span></div>
+  <span id="mbadge" class="badge demo">""" + TRADE_MODE + """</span>
 </div>
 <div class="main">
-  <div id="error-msg" class="error-msg"></div>
-
-  <div class="cards">
-    <div class="card">
-      <div class="label">Balance</div>
-      <div class="value blue" id="balance">$0.00</div>
-    </div>
-    <div class="card">
-      <div class="label">Total Trades</div>
-      <div class="value" id="total">0</div>
-    </div>
-    <div class="card">
-      <div class="label">Won</div>
-      <div class="value green" id="won">0</div>
-    </div>
-    <div class="card">
-      <div class="label">Lost</div>
-      <div class="value red" id="lost">0</div>
-    </div>
-    <div class="card">
-      <div class="label">Win Rate</div>
-      <div class="value yellow" id="winrate">0%</div>
-    </div>
-    <div class="card">
-      <div class="label">Pending</div>
-      <div class="value" id="pending">0</div>
-    </div>
+  <div id="err" class="err"></div>
+  <div class="grid">
+    <div class="card"><div class="lbl">Balance</div><div class="val b" id="bal">$0.00</div></div>
+    <div class="card"><div class="lbl">Total</div><div class="val" id="tot">0</div></div>
+    <div class="card"><div class="lbl">Won</div><div class="val g" id="won">0</div></div>
+    <div class="card"><div class="lbl">Lost</div><div class="val r" id="lst">0</div></div>
+    <div class="card"><div class="lbl">Win Rate</div><div class="val y" id="wr">0%</div></div>
+    <div class="card"><div class="lbl">Pending</div><div class="val" id="pnd">0</div></div>
   </div>
-
-  <div id="status-bar" class="status-bar disconnected">
-    <span class="dot red" id="dot"></span>
-    <span id="status-text">Disconnected</span>
+  <div id="sbar" class="bar ng"><span class="dot r" id="dot"></span><span id="stxt">Disconnected</span></div>
+  <div class="sig">📡 Signal: <b id="sig">—</b></div>
+  <div class="ctrls">
+    <button class="btn btn-s" id="bstart" onclick="startBot()">▶ START</button>
+    <button class="btn btn-x" id="bstop"  onclick="stopBot()" disabled>■ STOP</button>
   </div>
-
-  <div class="signal">📡 Last Signal: <b id="last-signal">—</b></div>
-
-  <div class="controls">
-    <button class="btn btn-start" id="btn-start" onclick="startBot()">▶ START</button>
-    <button class="btn btn-stop" id="btn-stop" onclick="stopBot()" disabled>■ STOP</button>
-  </div>
-
-  <div class="table-wrap">
+  <div class="tbl-wrap">
     <h3>Trade History</h3>
     <table>
-      <thead>
-        <tr>
-          <th>Time</th><th>Pair</th><th>Dir</th><th>Amount</th><th>Profit</th><th>Result</th>
-        </tr>
-      </thead>
-      <tbody id="trade-body">
-        <tr><td colspan="6" style="color:#546e7a;text-align:center;padding:20px">
-          No trades yet — press START to begin
-        </td></tr>
-      </tbody>
+      <thead><tr><th>Time</th><th>Pair</th><th>Dir</th><th>Amount</th><th>Profit</th><th>Result</th></tr></thead>
+      <tbody id="tbody"><tr><td colspan="6" style="color:#475569;text-align:center;padding:18px">
+        No trades yet — press START to begin
+      </td></tr></tbody>
     </table>
   </div>
 </div>
-
 <script>
-let ws = null;
-
-function connect() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(proto + '://' + location.host + '/ws');
-  ws.onmessage = (e) => {
-    const d = JSON.parse(e.data);
-    if (d.ping) return;
-    update(d);
-  };
-  ws.onclose = () => setTimeout(connect, 2000);
+let ws=null;
+function conn(){
+  const p=location.protocol==='https:'?'wss':'ws';
+  ws=new WebSocket(p+'://'+location.host+'/ws');
+  ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.ping)return;upd(d);};
+  ws.onclose=()=>setTimeout(conn,2000);
 }
-
-function update(d) {
-  document.getElementById('balance').textContent = '$' + (d.balance||0).toFixed(2);
-  document.getElementById('total').textContent   = d.total || 0;
-  document.getElementById('won').textContent     = d.won || 0;
-  document.getElementById('lost').textContent    = d.lost || 0;
-  document.getElementById('winrate').textContent = (d.winrate||0) + '%';
-  document.getElementById('pending').textContent = d.pending || 0;
-  document.getElementById('last-signal').textContent = d.last_signal || '—';
-
-  const bar  = document.getElementById('status-bar');
-  const dot  = document.getElementById('dot');
-  const txt  = document.getElementById('status-text');
-  const btnS = document.getElementById('btn-start');
-  const btnX = document.getElementById('btn-stop');
-  const errDiv = document.getElementById('error-msg');
-
-  if (d.error) {
-    errDiv.style.display = 'block';
-    errDiv.textContent = '⚠ ' + d.error;
-  } else {
-    errDiv.style.display = 'none';
-  }
-
-  if (d.connected) {
-    bar.className = 'status-bar connected';
-    dot.className = 'dot green';
-    txt.textContent = 'Connected to Pocket Option (' + (d.mode||'DEMO') + ')';
-  } else if (d.running) {
-    bar.className = 'status-bar running';
-    dot.className = 'dot blue';
-    txt.textContent = 'Connecting…';
-  } else {
-    bar.className = 'status-bar disconnected';
-    dot.className = 'dot red';
-    txt.textContent = 'Disconnected';
-  }
-
-  btnS.disabled = d.running;
-  btnX.disabled = !d.running;
-
-  if (d.trades && d.trades.length) {
-    const tbody = document.getElementById('trade-body');
-    tbody.innerHTML = d.trades.map(t => {
-      const cls = t.result === 'WIN' ? 'win' : 'loss';
-      const profit = t.profit >= 0 ? '+$' + t.profit.toFixed(2) : '-$' + Math.abs(t.profit).toFixed(2);
-      return '<tr>' +
-        '<td>' + t.time + '</td>' +
-        '<td>' + t.pair + '</td>' +
-        '<td>' + t.direction + '</td>' +
-        '<td>$' + t.amount.toFixed(2) + '</td>' +
-        '<td class="' + cls + '">' + profit + '</td>' +
-        '<td class="' + cls + '">' + t.result + '</td>' +
-        '</tr>';
+function upd(d){
+  document.getElementById('bal').textContent='$'+(d.balance||0).toFixed(2);
+  document.getElementById('tot').textContent=d.total||0;
+  document.getElementById('won').textContent=d.won||0;
+  document.getElementById('lst').textContent=d.lost||0;
+  document.getElementById('wr').textContent=(d.winrate||0)+'%';
+  document.getElementById('pnd').textContent=d.pending||0;
+  document.getElementById('sig').textContent=d.last_signal||'—';
+  const bar=document.getElementById('sbar'),dot=document.getElementById('dot'),
+        txt=document.getElementById('stxt'),bs=document.getElementById('bstart'),
+        bx=document.getElementById('bstop'),er=document.getElementById('err');
+  er.style.display=d.error?'block':'none';
+  if(d.error)er.textContent='⚠ '+d.error;
+  if(d.connected){bar.className='bar ok';dot.className='dot g';
+    txt.textContent='Connected · '+(d.mode||'DEMO')+' · Yahoo Finance ✓';}
+  else if(d.running){bar.className='bar cn';dot.className='dot b';txt.textContent='Connecting…';}
+  else{bar.className='bar ng';dot.className='dot r';txt.textContent='Disconnected';}
+  bs.disabled=d.running;bx.disabled=!d.running;
+  if(d.trades&&d.trades.length){
+    document.getElementById('tbody').innerHTML=d.trades.map(t=>{
+      const c=t.result==='WIN'?'win':'loss';
+      const p=t.profit>=0?'+$'+t.profit.toFixed(2):'-$'+Math.abs(t.profit).toFixed(2);
+      return`<tr><td>${t.time}</td><td>${t.pair}</td><td>${t.direction}</td>
+        <td>$${t.amount.toFixed(2)}</td><td class="${c}">${p}</td>
+        <td class="${c}">${t.result}</td></tr>`;
     }).join('');
   }
 }
-
-async function startBot() {
-  document.getElementById('btn-start').disabled = true;
-  const r = await fetch('/api/start', {method:'POST'});
-  const d = await r.json();
-  if (!d.ok) { alert(d.msg); document.getElementById('btn-start').disabled = false; }
+async function startBot(){
+  document.getElementById('bstart').disabled=true;
+  const r=await fetch('/api/start',{method:'POST'});
+  const d=await r.json();
+  if(!d.ok){alert(d.msg);document.getElementById('bstart').disabled=false;}
 }
-
-async function stopBot() {
-  document.getElementById('btn-stop').disabled = true;
-  await fetch('/api/stop', {method:'POST'});
+async function stopBot(){
+  document.getElementById('bstop').disabled=true;
+  await fetch('/api/stop',{method:'POST'});
 }
-
-connect();
+conn();
 </script>
 </body>
-</html>"""
-    return HTMLResponse(html)
+</html>""")
 
 
-# ══════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8001))
-    log.info("PO Trader v%s starting on port %d", VERSION, port)
+    log.info("PO Trader v%s on port %d", VERSION, port)
     uvicorn.run(app, host="0.0.0.0", port=port)
